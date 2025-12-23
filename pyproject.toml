@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reachy_mini_gemini_app"
+version = "0.1.0"
+description = "Reachy Mini conversation app using Google Gemini Live API"
+requires-python = ">=3.10"
+dependencies = [
+    "reachy_mini",
+    "google-genai>=1.0.0",
+    "pyaudio",
+    "numpy",
+    "opencv-python",
+    "scipy",
+]
+
+[project.optional-dependencies]
+wireless = [
+    "reachy_mini[gstreamer]",
+]
+dev = [
+    "pytest",
+    "ruff",
+]
+
+[project.scripts]
+reachy-mini-gemini = "reachy_mini_gemini_app.main:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
