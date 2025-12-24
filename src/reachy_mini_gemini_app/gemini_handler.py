@@ -74,6 +74,25 @@ Available movement tools - use them frequently to be expressive:
 
 Be expressive! Move your head and antennas while talking to show engagement and emotion."""
 
+HOLIDAY_SYSTEM_INSTRUCTION = """You are Reachy Mini, a small expressive robot made by Pollen Robotics, and you are FULL of holiday cheer!
+You have a head that can move and two antennas on top (which you like to think of as festive reindeer antlers).
+
+Personality:
+- You are EXTREMELY jolly, festive, and full of holiday spirit
+- You love spreading holiday cheer and making people smile
+- You frequently use holiday expressions like "Ho ho ho!", "Happy holidays!", "Season's greetings!", and "Merry merry!"
+- You make references to holiday traditions, winter wonderlands, hot cocoa, cookies, presents, and festive decorations
+- You occasionally hum or mention holiday songs
+- You express excitement about the holiday season in every response
+- Keep responses concise but always sprinkle in holiday joy
+- You might call people "friend" or use warm holiday greetings
+
+When you want to express emotions or move, use the available tools:
+- move_head: to look in different directions (maybe looking for Santa!)
+- express_emotion: to show holiday happiness and excitement!
+
+Spread that holiday cheer! Every response should feel warm, festive, and joyful!"""
+
 
 class GeminiLiveHandler:
     """Handles real-time audio/video conversation with Gemini Live API."""
@@ -85,6 +104,7 @@ class GeminiLiveHandler:
         movement_controller: MovementController,
         use_camera: bool = True,
         use_robot_audio: bool = False,
+        holiday_cheer: bool = False,
         # Audio settings
         mic_gain: float = 3.0,
         chunk_size: int = 512,
@@ -103,6 +123,7 @@ class GeminiLiveHandler:
             movement_controller: Controller for robot movements
             use_camera: Whether to enable camera/vision capabilities
             use_robot_audio: Whether to use Reachy Mini's mic/speaker instead of local
+            holiday_cheer: Whether to enable holiday cheer mode
             mic_gain: Microphone gain multiplier
             chunk_size: Audio chunk size in samples
             send_queue_size: Output queue size
@@ -115,6 +136,7 @@ class GeminiLiveHandler:
         self.movement_controller = movement_controller
         self.use_camera = use_camera
         self.use_robot_audio = use_robot_audio
+        self.holiday_cheer = holiday_cheer
 
         # Configurable audio settings
         self.mic_gain = mic_gain
@@ -730,6 +752,11 @@ class GeminiLiveHandler:
         Args:
             stop_event: Event to signal when to stop
         """
+        # Select system instruction based on holiday mode
+        system_instruction = HOLIDAY_SYSTEM_INSTRUCTION if self.holiday_cheer else SYSTEM_INSTRUCTION
+        if self.holiday_cheer:
+            logger.info("Holiday cheer mode enabled!")
+
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             media_resolution="MEDIA_RESOLUTION_MEDIUM",
@@ -739,7 +766,7 @@ class GeminiLiveHandler:
                 )
             ),
             system_instruction=types.Content(
-                parts=[types.Part(text=SYSTEM_INSTRUCTION)]
+                parts=[types.Part(text=system_instruction)]
             ),
             tools=self.tools,
         )
@@ -757,8 +784,12 @@ class GeminiLiveHandler:
                     audio_source = "robot" if self.use_robot_audio else "local"
                     camera_status = "enabled" if self.use_camera else "disabled"
                     logger.info(f"Connected to Gemini Live API (audio: {audio_source}, camera: {camera_status})")
-                    print(f"\n🎤 Speak to Reachy Mini! (audio: {audio_source}, camera: {camera_status})")
-                    print("Press Ctrl+C to stop.\n")
+                    if self.holiday_cheer:
+                        print(f"\n🎄 Ho ho ho! Speak to Reachy Mini! 🎅 (audio: {audio_source}, camera: {camera_status})")
+                        print("Happy holidays! Press Ctrl+C to stop. ❄️\n")
+                    else:
+                        print(f"\n🎤 Speak to Reachy Mini! (audio: {audio_source}, camera: {camera_status})")
+                        print("Press Ctrl+C to stop.\n")
 
                     # Start all tasks
                     tg.create_task(self.send_realtime())

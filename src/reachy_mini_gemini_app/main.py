@@ -70,6 +70,10 @@ def parse_args() -> argparse.Namespace:
         "--robot-audio", action="store_true",
         help="Use Reachy Mini's microphone and speaker instead of local audio"
     )
+    parser.add_argument(
+        "--holiday-cheer", action="store_true",
+        help="Enable holiday cheer mode with festive personality"
+    )
 
     # Audio tuning
     audio_group = parser.add_argument_group("Audio Settings")
@@ -128,6 +132,7 @@ async def run_conversation(
         movement_controller=movement_controller,
         use_camera=not args.no_camera,
         use_robot_audio=args.robot_audio,
+        holiday_cheer=args.holiday_cheer,
         # Audio settings
         mic_gain=args.mic_gain,
         chunk_size=args.chunk_size,
