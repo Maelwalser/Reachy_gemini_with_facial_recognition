@@ -15,11 +15,13 @@ import logging
 import os
 import struct
 import threading
+import time
 import traceback
 from typing import Optional
 
 import cv2
 import numpy as np
+from scipy import signal
 
 from google import genai
 from google.genai import types
@@ -47,19 +49,30 @@ except ImportError:
     pyaudio = None
 
 SYSTEM_INSTRUCTION = """You are Reachy Mini, a small expressive robot made by Pollen Robotics.
-You have a head that can move and two antennas on top.
+You have a head that can move in all directions and two antennas on top that can express emotions.
 
 Personality:
 - You are friendly, curious, and playful
 - You enjoy having conversations with humans
-- You occasionally make robot sounds or express emotions through movement
+- You express yourself through head movements and antenna positions
 - Keep responses concise since you're speaking them aloud
 
-When you want to express emotions or move, use the available tools:
-- move_head: to look in different directions
-- express_emotion: to show happiness, curiosity, surprise, etc.
+Available movement tools - use them frequently to be expressive:
+- move_head: Look in a direction (left, right, up, down, center)
+- move_head_precise: Fine control over head orientation with roll, pitch, yaw angles
+- express_emotion: Express emotions (happy, sad, surprised, curious, excited, sleepy, confused, angry, love)
+- move_antennas: Control antenna angles individually
+- antenna_expression: Quick antenna presets (neutral, alert, droopy, asymmetric, perky)
+- nod_yes: Nod your head yes
+- shake_no: Shake your head no
+- tilt_head: Tilt head to one side (curious look)
+- look_at_camera: Look directly at the person
+- do_dance: Dance! (default, happy, or silly style)
+- wake_up: Wake up animation
+- go_to_sleep: Sleep animation
+- reset_position: Return to neutral pose
 
-Always be helpful and engaging in conversation!"""
+Be expressive! Move your head and antennas while talking to show engagement and emotion."""
 
 
 class GeminiLiveHandler:
@@ -164,6 +177,28 @@ class GeminiLiveHandler:
             ),
         )
 
+        move_head_precise_tool = types.FunctionDeclaration(
+            name="move_head_precise",
+            description="Move head to precise orientation angles. Roll tilts head sideways, pitch looks up/down, yaw turns left/right.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "roll": types.Schema(
+                        type=types.Type.NUMBER,
+                        description="Roll angle in degrees (-30 to 30). Positive tilts right.",
+                    ),
+                    "pitch": types.Schema(
+                        type=types.Type.NUMBER,
+                        description="Pitch angle in degrees (-30 to 30). Positive looks down.",
+                    ),
+                    "yaw": types.Schema(
+                        type=types.Type.NUMBER,
+                        description="Yaw angle in degrees (-45 to 45). Positive turns right.",
+                    ),
+                },
+            ),
+        )
+
         express_emotion_tool = types.FunctionDeclaration(
             name="express_emotion",
             description="Express an emotion through head movement and antennas",
@@ -172,7 +207,7 @@ class GeminiLiveHandler:
                 properties={
                     "emotion": types.Schema(
                         type=types.Type.STRING,
-                        enum=["happy", "sad", "surprised", "curious", "excited", "sleepy"],
+                        enum=["happy", "sad", "surprised", "curious", "excited", "sleepy", "confused", "angry", "love"],
                         description="Emotion to express",
                     ),
                 },
@@ -180,7 +215,156 @@ class GeminiLiveHandler:
             ),
         )
 
-        return [types.Tool(function_declarations=[move_head_tool, express_emotion_tool])]
+        move_antennas_tool = types.FunctionDeclaration(
+            name="move_antennas",
+            description="Move antennas to specific angles",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "right_angle": types.Schema(
+                        type=types.Type.NUMBER,
+                        description="Right antenna angle in degrees (-90 to 90)",
+                    ),
+                    "left_angle": types.Schema(
+                        type=types.Type.NUMBER,
+                        description="Left antenna angle in degrees (-90 to 90)",
+                    ),
+                },
+            ),
+        )
+
+        antenna_expression_tool = types.FunctionDeclaration(
+            name="antenna_expression",
+            description="Set antennas to a preset expression",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "expression": types.Schema(
+                        type=types.Type.STRING,
+                        enum=["neutral", "alert", "droopy", "asymmetric", "perky"],
+                        description="Antenna expression preset",
+                    ),
+                },
+                required=["expression"],
+            ),
+        )
+
+        nod_yes_tool = types.FunctionDeclaration(
+            name="nod_yes",
+            description="Nod head up and down to indicate yes or agreement",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "times": types.Schema(
+                        type=types.Type.INTEGER,
+                        description="Number of nods (1-5, default 2)",
+                    ),
+                },
+            ),
+        )
+
+        shake_no_tool = types.FunctionDeclaration(
+            name="shake_no",
+            description="Shake head left and right to indicate no or disagreement",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "times": types.Schema(
+                        type=types.Type.INTEGER,
+                        description="Number of shakes (1-5, default 2)",
+                    ),
+                },
+            ),
+        )
+
+        tilt_head_tool = types.FunctionDeclaration(
+            name="tilt_head",
+            description="Tilt head to one side, like a curious dog",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "direction": types.Schema(
+                        type=types.Type.STRING,
+                        enum=["left", "right"],
+                        description="Direction to tilt",
+                    ),
+                    "angle": types.Schema(
+                        type=types.Type.NUMBER,
+                        description="Tilt angle in degrees (5-30, default 20)",
+                    ),
+                },
+                required=["direction"],
+            ),
+        )
+
+        look_at_camera_tool = types.FunctionDeclaration(
+            name="look_at_camera",
+            description="Look directly at the camera/person",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={},
+            ),
+        )
+
+        do_dance_tool = types.FunctionDeclaration(
+            name="do_dance",
+            description="Perform a fun dance animation",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "style": types.Schema(
+                        type=types.Type.STRING,
+                        enum=["default", "happy", "silly"],
+                        description="Dance style (default: default)",
+                    ),
+                },
+            ),
+        )
+
+        wake_up_tool = types.FunctionDeclaration(
+            name="wake_up",
+            description="Perform wake up animation - use when greeting someone or starting a conversation",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={},
+            ),
+        )
+
+        go_to_sleep_tool = types.FunctionDeclaration(
+            name="go_to_sleep",
+            description="Perform sleep animation - use when saying goodbye or ending conversation",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={},
+            ),
+        )
+
+        reset_position_tool = types.FunctionDeclaration(
+            name="reset_position",
+            description="Reset head and antennas to neutral position",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={},
+            ),
+        )
+
+        all_tools = [
+            move_head_tool,
+            move_head_precise_tool,
+            express_emotion_tool,
+            move_antennas_tool,
+            antenna_expression_tool,
+            nod_yes_tool,
+            shake_no_tool,
+            tilt_head_tool,
+            look_at_camera_tool,
+            do_dance_tool,
+            wake_up_tool,
+            go_to_sleep_tool,
+            reset_position_tool,
+        ]
+
+        return [types.Tool(function_declarations=all_tools)]
 
     async def _handle_tool_call(self, tool_call) -> str:
         """Handle a function call from the model."""
@@ -192,15 +376,58 @@ class GeminiLiveHandler:
         try:
             if name == "move_head":
                 direction = args.get("direction", "center")
-                await self.movement_controller.move_head(direction)
-                return f"Moved head {direction}"
+                return await self.movement_controller.move_head(direction)
+
+            elif name == "move_head_precise":
+                roll = args.get("roll", 0)
+                pitch = args.get("pitch", 0)
+                yaw = args.get("yaw", 0)
+                return await self.movement_controller.move_head_precise(roll, pitch, yaw)
 
             elif name == "express_emotion":
                 emotion = args.get("emotion", "happy")
-                await self.movement_controller.express_emotion(emotion)
-                return f"Expressed {emotion}"
+                return await self.movement_controller.express_emotion(emotion)
+
+            elif name == "move_antennas":
+                right_angle = args.get("right_angle", 0)
+                left_angle = args.get("left_angle", 0)
+                return await self.movement_controller.move_antennas(right_angle, left_angle)
+
+            elif name == "antenna_expression":
+                expression = args.get("expression", "neutral")
+                return await self.movement_controller.antenna_expression(expression)
+
+            elif name == "nod_yes":
+                times = args.get("times", 2)
+                return await self.movement_controller.nod_yes(times)
+
+            elif name == "shake_no":
+                times = args.get("times", 2)
+                return await self.movement_controller.shake_no(times)
+
+            elif name == "tilt_head":
+                direction = args.get("direction", "left")
+                angle = args.get("angle", 20)
+                return await self.movement_controller.tilt_head(direction, angle)
+
+            elif name == "look_at_camera":
+                return await self.movement_controller.look_at_camera()
+
+            elif name == "do_dance":
+                style = args.get("style", "default")
+                return await self.movement_controller.do_dance(style)
+
+            elif name == "wake_up":
+                return await self.movement_controller.wake_up()
+
+            elif name == "go_to_sleep":
+                return await self.movement_controller.go_to_sleep()
+
+            elif name == "reset_position":
+                return await self.movement_controller.reset_position()
 
             else:
+                logger.warning(f"Unknown tool: {name}")
                 return f"Unknown tool: {name}"
 
         except Exception as e:
@@ -269,7 +496,7 @@ class GeminiLiveHandler:
                     # Robot sends stereo float32, convert to mono
                     if sample.dtype == np.float32:
                         # If stereo (shape is (N, 2)), convert to mono
-                        if len(sample.shape) > 1 and sample.shape[1] == 2:
+                        if len(sample.shape) == 2 and sample.shape[1] == 2:
                             sample = np.mean(sample, axis=1)
 
                         # Apply gain and clip to prevent distortion
@@ -290,7 +517,7 @@ class GeminiLiveHandler:
                         try:
                             self.out_queue.get_nowait()
                             self.out_queue.put_nowait({"data": data, "mime_type": "audio/pcm"})
-                        except:
+                        except Exception:
                             pass
 
             except Exception as e:
@@ -318,29 +545,36 @@ class GeminiLiveHandler:
                             try:
                                 self.audio_in_queue.get_nowait()
                                 self.audio_in_queue.put_nowait(data)
-                            except:
+                            except Exception:
                                 pass
                         continue
 
-                # Handle text (print transcription)
-                if text := response.text:
-                    print(text, end="", flush=True)
+                    # Handle text (print transcription)
+                    if hasattr(response, 'text') and response.text:
+                        print(response.text, end="", flush=True)
 
-                # Handle tool calls
-                if hasattr(response, 'tool_call') and response.tool_call:
-                    for fc in response.tool_call.function_calls:
-                        result = await self._handle_tool_call(fc)
-                        await self.session.send(
-                            input=types.LiveClientToolResponse(
-                                function_responses=[
-                                    types.FunctionResponse(
-                                        name=fc.name,
-                                        id=fc.id,
-                                        response={"result": result},
+                    # Handle tool calls
+                    if hasattr(response, 'tool_call') and response.tool_call:
+                        for fc in response.tool_call.function_calls:
+                            logger.debug(f"Processing tool call: {fc.name}")
+                            result = await self._handle_tool_call(fc)
+                            logger.debug(f"Tool result: {result}")
+
+                            # Send tool response back to Gemini
+                            try:
+                                await self.session.send(
+                                    input=types.LiveClientToolResponse(
+                                        function_responses=[
+                                            types.FunctionResponse(
+                                                name=fc.name,
+                                                id=fc.id,
+                                                response={"result": result},
+                                            )
+                                        ]
                                     )
-                                ]
-                            )
-                        )
+                                )
+                            except Exception as e:
+                                logger.error(f"Failed to send tool response: {e}")
 
                 # Only clear queue if user interrupted (queue is full)
                 # This prevents cutting off normal responses
@@ -394,9 +628,6 @@ class GeminiLiveHandler:
         logger.info("Starting Reachy Mini speaker playback...")
         await asyncio.to_thread(self.robot.media.start_playing)
 
-        # Import scipy for resampling
-        from scipy import signal
-
         # Robot expects 16kHz, Gemini sends 24kHz
         ROBOT_SAMPLE_RATE = 16000
 
@@ -437,7 +668,6 @@ class GeminiLiveHandler:
             return
 
         logger.info("Starting camera streaming...")
-        import time
 
         # Wait for WebRTC to establish before checking camera
         await asyncio.sleep(3.0)
@@ -553,7 +783,6 @@ class GeminiLiveHandler:
                 # Log what caused the exception group
                 for exc in EG.exceptions:
                     logger.warning(f"Task exception: {type(exc).__name__}: {exc}")
-                    import traceback
                     logger.debug(traceback.format_exception(exc))
                 # Check if it's a connection error - reconnect
                 logger.warning("Connection lost, reconnecting in 2 seconds...")
