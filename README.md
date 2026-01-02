@@ -5,7 +5,7 @@ colorFrom: purple
 colorTo: blue
 sdk: static
 pinned: false
-short_description: Real-time voice conversations with Reachy Mini using Gemini Live API
+short_description: Talk to Reachy Mini using Gemini Live API
 tags:
   - reachy_mini
   - reachy_mini_python_app
