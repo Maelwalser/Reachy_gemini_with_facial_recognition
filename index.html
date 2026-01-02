@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Reachy Mini Gemini Live App</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>Reachy Mini Gemini Live App</h1>
+            <p class="tagline">Real-time voice and video conversations with Reachy Mini using Google's Gemini Live API</p>
+        </header>
+
+        <section class="features">
+            <h2>Features</h2>
+            <ul>
+                <li><strong>Real-time voice conversation</strong> via Gemini Live API</li>
+                <li><strong>Camera streaming</strong> - Reachy Mini sees and understands its environment</li>
+                <li><strong>Robot audio</strong> - Use Reachy Mini's microphone and speaker</li>
+                <li><strong>Expressive movements</strong> - Head movements and antenna animations</li>
+                <li><strong>Emotion expressions</strong> - Happy, sad, surprised, curious, excited, sleepy</li>
+                <li><strong>Wireless support</strong> - Works with wireless Reachy Mini</li>
+            </ul>
+        </section>
+
+        <section class="requirements">
+            <h2>Requirements</h2>
+            <ul>
+                <li>Reachy Mini robot (or simulation)</li>
+                <li>Google API key with Gemini access</li>
+                <li>Set <code>GOOGLE_API_KEY</code> environment variable</li>
+            </ul>
+        </section>
+
+        <section class="usage">
+            <h2>Usage</h2>
+            <p>Once installed via the Reachy Mini dashboard, the app runs automatically. Configure your Google API key in the environment before starting.</p>
+            <div class="code-block">
+                <code>export GOOGLE_API_KEY=your-key-here</code>
+            </div>
+        </section>
+
+        <section class="modes">
+            <h2>Audio Modes</h2>
+            <div class="mode-cards">
+                <div class="card">
+                    <h3>Local Audio</h3>
+                    <p>Uses your computer's microphone and speakers</p>
+                </div>
+                <div class="card">
+                    <h3>Robot Audio</h3>
+                    <p>Uses Reachy Mini's built-in mic and speaker via WebRTC</p>
+                </div>
+            </div>
+        </section>
+
+        <footer>
+            <p>Powered by Google Gemini Live API and Reachy Mini SDK</p>
+            <p>License: Apache 2.0</p>
+        </footer>
+    </div>
+</body>
+</html>

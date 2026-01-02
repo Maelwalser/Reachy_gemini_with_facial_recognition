@@ -1,3 +1,16 @@
+---
+title: Reachy Mini Gemini Live App
+emoji: 🤖
+colorFrom: purple
+colorTo: blue
+sdk: static
+pinned: false
+short_description: Real-time voice conversations with Reachy Mini using Gemini Live API
+tags:
+  - reachy_mini
+  - reachy_mini_python_app
+---
+
 # Reachy Mini Gemini Live App
 
 Talk with Reachy Mini using Google's Gemini Live API for real-time voice conversations.

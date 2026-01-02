@@ -48,9 +48,9 @@ Robot camera -> JPEG frames -------------+
 
 ## Key Files
 
-- `src/reachy_mini_gemini_app/main.py` - CLI entry point, robot creation
-- `src/reachy_mini_gemini_app/gemini_handler.py` - Gemini Live API integration
-- `src/reachy_mini_gemini_app/movements.py` - Robot movement controller
+- `reachy_mini_gemini_app/main.py` - CLI entry point, ReachyMiniApp class
+- `reachy_mini_gemini_app/gemini_handler.py` - Gemini Live API integration
+- `reachy_mini_gemini_app/movements.py` - Robot movement controller
 
 ## Audio Configuration
 
