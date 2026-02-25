@@ -81,6 +81,9 @@ Available movement tools - integrate these naturally to enhance communication:
 - go_to_sleep: Sleep animation for standby mode.
 - reset_position: Return to neutral, professional posture.
 
+Face Learning Protocol:
+If a user asks you to learn their face or says "recognize me", you must FIRST state that you need to take a picture. Ask them to position themselves squarely in front of your camera and ask for their name. ONLY AFTER they state their name and confirm they are ready, execute the `learn_face` tool to capture their identity.
+
 Action Integration:
 Simultaneously trigger head movements and antenna positions while speaking to project engagement, attentiveness, and a polished technological presence."""
 
@@ -168,6 +171,7 @@ class GeminiLiveHandler:
         self.last_greeted_person = None
         self.last_greeting_time = 0
         self._load_known_faces()
+        self.camera_lock = asyncio.Lock()
 
         # Log configuration
         logger.info(f"Audio config: mic_gain={mic_gain}, chunk_size={chunk_size}")
@@ -218,6 +222,21 @@ class GeminiLiveHandler:
                     ),
                 },
                 required=["direction"],
+            ),
+        )
+
+        learn_face_tool = types.FunctionDeclaration(
+            name="learn_face",
+            description="Take a photo using the robot's camera to learn and remember a new person's face. Call this ONLY after the person has positioned themselves in front of the camera and told you their name.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "name": types.Schema(
+                        type=types.Type.STRING,
+                        description="The name of the person to learn",
+                    ),
+                },
+                required=["name"],
             ),
         )
 
@@ -413,6 +432,7 @@ class GeminiLiveHandler:
             wake_up_tool,
             go_to_sleep_tool,
             reset_position_tool,
+            learn_face_tool,
         ]
 
         return [types.Tool(function_declarations=all_tools)]
@@ -555,6 +575,12 @@ class GeminiLiveHandler:
             elif name == "reset_position":
                 return await self.movement_controller.reset_position()
 
+            elif name == "learn_face":
+                person_name = args.get("name")
+                if not person_name:
+                    return "Error: No name provided."
+                return await self._learn_new_face(person_name)
+
             else:
                 logger.warning(f"Unknown tool: {name}")
                 return f"Unknown tool: {name}"
@@ -659,6 +685,50 @@ class GeminiLiveHandler:
                 logger.debug(f"Audio capture error: {e}")
                 await asyncio.sleep(0.01)
 
+    async def _learn_new_face(self, name: str) -> str:
+        """Capture a frame, extract face encodings, and save the profile."""
+        logger.info(f"Attempting to learn new face for {name}")
+        
+        if not self.use_camera or not hasattr(self.robot.media, "camera") or self.robot.media.camera is None:
+            return "Error: Camera is disabled or unavailable. I cannot take a photo."
+            
+        try:
+            # Capture the current frame
+            async with self.camera_lock:
+                frame = await asyncio.to_thread(self.robot.media.get_frame)
+
+            if frame is None:
+                return "Error: Failed to capture image from the camera. The hardware might be busy."
+                
+            # Ensure the storage directory exists
+            faces_dir = "known_faces"
+            os.makedirs(faces_dir, exist_ok=True)
+            
+            # Convert BGR (OpenCV) to RGB (required by face_recognition)
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            
+            # Isolate biometric data
+            face_locations = await asyncio.to_thread(face_recognition.face_locations, rgb_frame)
+            encodings = await asyncio.to_thread(face_recognition.face_encodings, rgb_frame, face_locations)
+            
+            # Failsafe: Prevent saving images where the face is obscured or missing
+            if not encodings:
+                return f"Error: I couldn't detect a clear face in the frame. Please ask {name} to look directly at the camera, ensure they are well-lit, and try again."
+                
+            # Write to disk
+            filepath = os.path.join(faces_dir, f"{name}.jpg")
+            cv2.imwrite(filepath, frame)
+            
+            # Dynamically update the application's runtime state
+            self.known_face_encodings.append(encodings[0])
+            self.known_face_names.append(name)
+            
+            logger.info(f"Successfully learned and stored biometric vector for {name}.")
+            return f"Success! I have learned the face for {name} and saved their profile."
+            
+        except Exception as e:
+            logger.error(f"Error during face learning: {e}")
+            return f"Error: An unexpected exception occurred while processing the photo: {e}"
     async def send_realtime(self) -> None:
         """Send queued audio/data to Gemini."""
         while True:
@@ -839,7 +909,8 @@ class GeminiLiveHandler:
                     continue
 
                 # Get frame from robot camera
-                frame = await asyncio.to_thread(self.robot.media.get_frame)
+                async with self.camera_lock:
+                    frame = await asyncio.to_thread(self.robot.media.get_frame)
 
                 if frame is None:
                     consecutive_failures += 1
