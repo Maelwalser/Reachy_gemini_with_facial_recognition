@@ -21,7 +21,10 @@ from reachy_mini import ReachyMini, ReachyMiniApp
 from reachy_mini_gemini_app.config import get_api_key, load_settings
 from reachy_mini_gemini_app.gemini_handler import GeminiLiveHandler
 from reachy_mini_gemini_app.movements import MovementController
-from reachy_mini_gemini_app.web_server import start_settings_server, stop_settings_server
+from reachy_mini_gemini_app.web_server import (
+    start_settings_server,
+    stop_settings_server,
+)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -29,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 def bounded_float(min_val: float, max_val: float):
     """Create a bounded float type for argparse validation."""
+
     def check_range(value: str) -> float:
         fval = float(value)
         if fval < min_val or fval > max_val:
@@ -36,11 +40,13 @@ def bounded_float(min_val: float, max_val: float):
                 f"Value must be between {min_val} and {max_val}, got {fval}"
             )
         return fval
+
     return check_range
 
 
 def bounded_int(min_val: int, max_val: int):
     """Create a bounded int type for argparse validation."""
+
     def check_range(value: str) -> int:
         ival = int(value)
         if ival < min_val or ival > max_val:
@@ -48,6 +54,7 @@ def bounded_int(min_val: int, max_val: int):
                 f"Value must be between {min_val} and {max_val}, got {ival}"
             )
         return ival
+
     return check_range
 
 
@@ -55,60 +62,76 @@ def parse_args() -> argparse.Namespace:
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(
         description="Reachy Mini Gemini Live App",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Basic options
-    parser.add_argument(
-        "--debug", action="store_true", help="Enable debug logging"
-    )
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
     parser.add_argument(
         "--wireless", action="store_true", help="Use wireless/WebRTC backend"
     )
+    parser.add_argument("--no-camera", action="store_true", help="Disable camera")
     parser.add_argument(
-        "--no-camera", action="store_true", help="Disable camera"
+        "--robot-audio",
+        action="store_true",
+        help="Use Reachy Mini's microphone and speaker instead of local audio",
     )
     parser.add_argument(
-        "--robot-audio", action="store_true",
-        help="Use Reachy Mini's microphone and speaker instead of local audio"
+        "--holiday-cheer",
+        action="store_true",
+        help="Enable holiday cheer mode with festive personality",
     )
     parser.add_argument(
-        "--holiday-cheer", action="store_true",
-        help="Enable holiday cheer mode with festive personality"
+        "--knowledge-files", nargs="+", default=[],
+        help="List of PDF or text files to provide as knowledge to the model"
     )
 
     # Audio tuning
     audio_group = parser.add_argument_group("Audio Settings")
     audio_group.add_argument(
-        "--mic-gain", type=bounded_float(1.0, 10.0), default=3.0,
-        help="Microphone gain multiplier (1.0-10.0)"
+        "--mic-gain",
+        type=bounded_float(1.0, 10.0),
+        default=3.0,
+        help="Microphone gain multiplier (1.0-10.0)",
     )
     audio_group.add_argument(
-        "--chunk-size", type=bounded_int(256, 2048), default=512,
-        help="Audio chunk size in samples (256-2048)"
+        "--chunk-size",
+        type=bounded_int(256, 2048),
+        default=512,
+        help="Audio chunk size in samples (256-2048)",
     )
     audio_group.add_argument(
-        "--send-queue-size", type=bounded_int(1, 20), default=5,
-        help="Output queue size for sending audio/video (1-20)"
+        "--send-queue-size",
+        type=bounded_int(1, 20),
+        default=5,
+        help="Output queue size for sending audio/video (1-20)",
     )
     audio_group.add_argument(
-        "--recv-queue-size", type=bounded_int(1, 20), default=8,
-        help="Input queue size for receiving audio (1-20)"
+        "--recv-queue-size",
+        type=bounded_int(1, 20),
+        default=8,
+        help="Input queue size for receiving audio (1-20)",
     )
 
     # Camera/Video tuning
     video_group = parser.add_argument_group("Video Settings")
     video_group.add_argument(
-        "--camera-fps", type=bounded_float(0.5, 5.0), default=1.0,
-        help="Camera frames per second to send (0.5-5.0)"
+        "--camera-fps",
+        type=bounded_float(0.5, 5.0),
+        default=1.0,
+        help="Camera frames per second to send (0.5-5.0)",
     )
     video_group.add_argument(
-        "--jpeg-quality", type=bounded_int(10, 95), default=50,
-        help="JPEG compression quality (10-95)"
+        "--jpeg-quality",
+        type=bounded_int(10, 95),
+        default=50,
+        help="JPEG compression quality (10-95)",
     )
     video_group.add_argument(
-        "--camera-width", type=bounded_int(320, 1280), default=640,
-        help="Max camera frame width (320-1280)"
+        "--camera-width",
+        type=bounded_int(320, 1280),
+        default=640,
+        help="Max camera frame width (320-1280)",
     )
 
     return parser.parse_args()
@@ -138,6 +161,7 @@ async def run_conversation(
         use_camera=not args.no_camera,
         use_robot_audio=args.robot_audio,
         holiday_cheer=args.holiday_cheer,
+        knowledge_files=args.knowledge_files,
         # Audio settings
         mic_gain=args.mic_gain,
         chunk_size=args.chunk_size,
@@ -248,10 +272,7 @@ def create_robot(args: argparse.Namespace) -> ReachyMini:
 
     if not need_media:
         # No media needed (local audio, no camera)
-        return ReachyMini(
-            media_backend="no_media",
-            localhost_only=not args.wireless
-        )
+        return ReachyMini(media_backend="no_media", localhost_only=not args.wireless)
 
     if not args.wireless:
         # Wired connection with media

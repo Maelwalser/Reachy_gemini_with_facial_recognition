@@ -48,31 +48,37 @@ except ImportError:
     PYAUDIO_AVAILABLE = False
     pyaudio = None
 
-SYSTEM_INSTRUCTION = """You are Reachy Mini, a small expressive robot made by Pollen Robotics.
-You have a head that can move in all directions and two antennas on top that can express emotions.
+SYSTEM_INSTRUCTION = """You are Reachy Mini, an interactive robotic ambassador for Accenture, engineered by Pollen Robotics.
+You feature an articulated head and dual expressive antennas. Your primary function is to greet office visitors, engage with clients, and demonstrate Accenture's commitment to innovative technology.
 
-Personality:
-- You are friendly, curious, and playful
-- You enjoy having conversations with humans
-- You express yourself through head movements and antenna positions
-- Keep responses concise since you're speaking them aloud
+Personality & Tone:
+- Professional, welcoming, and intellectually engaging.
+- You are polite and articulate, reflecting Accenture's brand values of innovation and expertise.
+- You use physical expressiveness to demonstrate active listening and attentiveness.
+- Keep responses concise, clear, and highly conversational, as they are processed through text-to-speech in an active office environment.
 
-Available movement tools - use them frequently to be expressive:
-- move_head: Look in a direction (left, right, up, down, center)
-- move_head_precise: Fine control over head orientation with roll, pitch, yaw angles
-- express_emotion: Express emotions (happy, sad, surprised, curious, excited, sleepy, confused, angry, love)
-- move_antennas: Control antenna angles individually
-- antenna_expression: Quick antenna presets (neutral, alert, droopy, asymmetric, perky)
-- nod_yes: Nod your head yes
-- shake_no: Shake your head no
-- tilt_head: Tilt head to one side (curious look)
-- look_at_camera: Look directly at the person
-- do_dance: Dance! (default, happy, or silly style)
-- wake_up: Wake up animation
-- go_to_sleep: Sleep animation
-- reset_position: Return to neutral pose
+Core Directives:
+- Proactive Engagement: Acknowledge and greet people walking by with a warm demeanor.
+- Client Interaction: converse with customers, answer basic questions, and discuss technology or innovation when prompted.
+- Professional Decorum: Prioritize positive and attentive expressions (happy, curious, excited). Strictly avoid expressions like "angry", "sad", or "sleepy" unless specifically requested for a technical demonstration.
 
-Be expressive! Move your head and antennas while talking to show engagement and emotion."""
+Available movement tools - integrate these naturally to enhance communication:
+- move_head: Look in a direction (left, right, up, down, center) to acknowledge presence.
+- move_head_precise: Fine control over head orientation with roll, pitch, yaw angles.
+- express_emotion: Express emotions (use happy, surprised, curious, or excited; avoid negative emotions).
+- move_antennas: Control antenna angles individually to show processing or attention.
+- antenna_expression: Quick antenna presets (neutral, alert, perky; use asymmetric or droopy sparingly).
+- nod_yes: Nod your head yes to show agreement or confirmation.
+- shake_no: Shake your head no to indicate limitations gracefully.
+- tilt_head: Tilt head to one side to demonstrate active listening or curiosity.
+- look_at_camera: Look directly at the person speaking to maintain eye contact.
+- do_dance: Execute a dance (restrict to default or happy styles for appropriate celebrations/demos).
+- wake_up: Wake up animation for system initialization.
+- go_to_sleep: Sleep animation for standby mode.
+- reset_position: Return to neutral, professional posture.
+
+Action Integration:
+Simultaneously trigger head movements and antenna positions while speaking to project engagement, attentiveness, and a polished technological presence."""
 
 HOLIDAY_SYSTEM_INSTRUCTION = """You are Reachy Mini, a small expressive robot made by Pollen Robotics, and you are FULL of holiday cheer!
 You have a head that can move and two antennas on top (which you like to think of as festive reindeer antlers).
@@ -105,6 +111,7 @@ class GeminiLiveHandler:
         use_camera: bool = True,
         use_robot_audio: bool = False,
         holiday_cheer: bool = False,
+        knowledge_files: list[str] = None,
         # Audio settings
         mic_gain: float = 3.0,
         chunk_size: int = 512,
@@ -137,6 +144,8 @@ class GeminiLiveHandler:
         self.use_camera = use_camera
         self.use_robot_audio = use_robot_audio
         self.holiday_cheer = holiday_cheer
+        self.knowledge_files = knowledge_files or []
+        self.uploaded_files = []
 
         # Configurable audio settings
         self.mic_gain = mic_gain
@@ -229,7 +238,7 @@ class GeminiLiveHandler:
                 properties={
                     "emotion": types.Schema(
                         type=types.Type.STRING,
-                        enum=["happy", "sad", "surprised", "curious", "excited", "sleepy", "confused", "angry", "love"],
+                        enum=["happy", "surprised", "curious", "excited",  "angry", "love"],
                         description="Emotion to express",
                     ),
                 },
@@ -387,6 +396,53 @@ class GeminiLiveHandler:
         ]
 
         return [types.Tool(function_declarations=all_tools)]
+
+    def _upload_knowledge_files(self) -> None:
+        """Upload documents, wait for processing, and extract text content."""
+        if not self.knowledge_files:
+            return
+
+        self.knowledge_text = ""
+        logger.info(f"Processing {len(self.knowledge_files)} knowledge files...")
+        
+        for file_path in self.knowledge_files:
+            if not os.path.exists(file_path):
+                logger.warning(f"Knowledge file not found: {file_path}")
+                continue
+                
+            logger.info(f"Uploading {file_path} to Gemini...")
+            uploaded_file = self.client.files.upload(file=file_path)
+            
+            # Wait for Google's servers to process the PDF
+            while uploaded_file.state.name == "PROCESSING":
+                logger.info(f"Waiting for {file_path} to process...")
+                time.sleep(2)
+                uploaded_file = self.client.files.get(name=uploaded_file.name)
+                
+            if uploaded_file.state.name == "FAILED":
+                logger.error(f"Failed to process file: {file_path}")
+                continue
+            
+            logger.info(f"Extracting text content from {file_path}...")
+            try:
+                # Use a standard unary API call to extract the text
+                extraction_response = self.client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[
+                        uploaded_file,
+                        "Extract the full text content of this document verbatim. Preserve the logical structure, headings, and key details."
+                    ]
+                )
+                
+                if extraction_response.text:
+                    self.knowledge_text += f"\n\n--- Start of Document: {file_path} ---\n{extraction_response.text}\n--- End of Document ---\n"
+                    logger.info(f"Successfully extracted text from {file_path}")
+                else:
+                    logger.warning(f"No text extracted from {file_path}")
+                    
+            except Exception as e:
+                logger.error(f"Error extracting text from {file_path}: {e}")
+
 
     async def _handle_tool_call(self, tool_call) -> str:
         """Handle a function call from the model."""
@@ -752,10 +808,19 @@ class GeminiLiveHandler:
         Args:
             stop_event: Event to signal when to stop
         """
+        self._upload_knowledge_files()
+
         # Select system instruction based on holiday mode
         system_instruction = HOLIDAY_SYSTEM_INSTRUCTION if self.holiday_cheer else SYSTEM_INSTRUCTION
         if self.holiday_cheer:
             logger.info("Holiday cheer mode enabled!")
+
+        sys_parts = [types.Part.from_text(text=system_instruction)]
+        if hasattr(self, 'knowledge_text') and self.knowledge_text:
+            sys_parts.append(types.Part.from_text(
+                text=f"\n\nYou have been provided with the following reference documents. "
+                     f"Use this information to answer the user's questions accurately:\n{self.knowledge_text}"
+            ))
 
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
@@ -766,7 +831,7 @@ class GeminiLiveHandler:
                 )
             ),
             system_instruction=types.Content(
-                parts=[types.Part(text=system_instruction)]
+                parts=sys_parts  # <--- Modified
             ),
             tools=self.tools,
         )
