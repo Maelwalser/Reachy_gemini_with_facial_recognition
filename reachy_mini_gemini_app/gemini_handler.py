@@ -19,6 +19,9 @@ import time
 import traceback
 from typing import Optional
 
+import face_recognition
+import glob
+
 import cv2
 import numpy as np
 from scipy import signal
@@ -158,6 +161,13 @@ class GeminiLiveHandler:
         self.jpeg_quality = jpeg_quality
         self.camera_width = camera_width
 
+        # Initialize facial recognition state
+        self.known_face_encodings = []
+        self.known_face_names = []
+        self.last_greeted_person = None
+        self.last_greeting_time = 0
+        self._load_known_faces()
+
         # Log configuration
         logger.info(f"Audio config: mic_gain={mic_gain}, chunk_size={chunk_size}")
         logger.info(f"Queue config: send={send_queue_size}, recv={recv_queue_size}")
@@ -238,7 +248,7 @@ class GeminiLiveHandler:
                 properties={
                     "emotion": types.Schema(
                         type=types.Type.STRING,
-                        enum=["happy", "surprised", "curious", "excited",  "angry", "love"],
+                        enum=["happy", "surprised", "curious", "excited", "angry", "love"],
                         description="Emotion to express",
                     ),
                 },
@@ -396,6 +406,28 @@ class GeminiLiveHandler:
         ]
 
         return [types.Tool(function_declarations=all_tools)]
+
+    def _load_known_faces(self, faces_dir: str = "known_faces") -> None:
+        """Load and encode reference images for deterministic identification."""
+        if not os.path.exists(faces_dir):
+            logger.warning(f"Face recognition directory '{faces_dir}' not found. Skipping.")
+            return
+
+        logger.info(f"Loading reference biometric vectors from {faces_dir}...")
+        for image_path in glob.glob(os.path.join(faces_dir, "*.jpg")) + glob.glob(os.path.join(faces_dir, "*.png")):
+            try:
+                name = os.path.splitext(os.path.basename(image_path))[0]
+                image = face_recognition.load_image_file(image_path)
+                encodings = face_recognition.face_encodings(image)
+                
+                if encodings:
+                    self.known_face_encodings.append(encodings[0])
+                    self.known_face_names.append(name)
+                    logger.debug(f"Successfully loaded encoding for {name}")
+                else:
+                    logger.warning(f"No clear face detected in reference image: {image_path}")
+            except Exception as e:
+                logger.error(f"Failed to process reference image {image_path}: {e}")
 
     def _upload_knowledge_files(self) -> None:
         """Upload documents, wait for processing, and extract text content."""
@@ -605,8 +637,18 @@ class GeminiLiveHandler:
     async def send_realtime(self) -> None:
         """Send queued audio/data to Gemini."""
         while True:
+
             msg = await self.out_queue.get()
-            await self.session.send(input=msg)
+            # Type differentiation logic
+            if isinstance(msg, str):
+                # The SDK automatically serializes raw strings into Text Parts
+                await self.session.send(input=msg, end_of_turn=True)
+            elif isinstance(msg, dict):
+                # Standard audio/video raw byte dictionaries
+                await self.session.send(input=msg)
+            else:
+                logger.warning(f"Unrecognized message type in output queue: {type(msg)}")
+
 
     async def receive_audio(self) -> None:
         """Receive responses from Gemini and handle them."""
@@ -754,6 +796,10 @@ class GeminiLiveHandler:
         consecutive_failures = 0
         max_failures = 30  # Give more time for WebRTC camera stream
 
+
+        frame_count = 0
+        FACE_CHECK_INTERVAL = int(self.camera_fps * 2) # Check roughly every 2 seconds
+
         while True:
             try:
                 current_time = time.time()
@@ -766,6 +812,9 @@ class GeminiLiveHandler:
                 # Get frame from robot camera
                 frame = await asyncio.to_thread(self.robot.media.get_frame)
 
+
+
+
                 if frame is None:
                     consecutive_failures += 1
                     if consecutive_failures >= max_failures:
@@ -776,6 +825,37 @@ class GeminiLiveHandler:
 
                 consecutive_failures = 0
                 self.last_frame_time = current_time
+
+                frame_count += 1
+                if self.known_face_encodings and frame_count % FACE_CHECK_INTERVAL == 0:
+                    # Downscale for performance
+                    small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
+                    rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Detect and encode
+                    face_locations = await asyncio.to_thread(face_recognition.face_locations, rgb_small_frame)
+                    face_encodings = await asyncio.to_thread(face_recognition.face_encodings, rgb_small_frame, face_locations)
+                    
+                    for face_encoding in face_encodings:
+                        matches = face_recognition.compare_faces(self.known_face_encodings, face_encoding, tolerance=0.6)
+                        if True in matches:
+                            first_match_index = matches.index(True)
+                            name = self.known_face_names[first_match_index]
+                            
+                            # Debounce greetings (e.g., don't greet the same person more than once every 60 seconds)
+                            if name != self.last_greeted_person or (current_time - self.last_greeting_time > 60):
+                                logger.info(f"Positive identification: {name}. Injecting context.")
+                                self.last_greeted_person = name
+                                self.last_greeting_time = current_time
+                                
+                                # Inject explicit context into the Gemini session
+                                alert_msg = f"Look! {name} has just approached you. Greet them warmly and audibly by their name right now."
+
+                                # Put in send queue, bypassing the standard audio/video dict format
+                                try:
+                                    self.out_queue.put_nowait(alert_msg)
+                                except asyncio.QueueFull:
+                                    pass
 
                 # Resize frame for efficiency
                 h, w = frame.shape[:2]
