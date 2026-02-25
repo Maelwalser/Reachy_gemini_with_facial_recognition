@@ -9,27 +9,22 @@ Receive sample rate: 24kHz
 """
 
 import asyncio
-import base64
-import io
+import glob
 import logging
 import os
-import struct
 import threading
 import time
 import traceback
-from typing import Optional
-
-import face_recognition
-import glob
+from typing import Any, cast
 
 import cv2
+import face_recognition
 import numpy as np
-from scipy import signal
-
 from google import genai
 from google.genai import types
-
 from reachy_mini import ReachyMini
+from scipy import signal
+
 from reachy_mini_gemini_app.movements import MovementController
 
 logger = logging.getLogger(__name__)
@@ -118,7 +113,7 @@ class GeminiLiveHandler:
         use_camera: bool = True,
         use_robot_audio: bool = False,
         holiday_cheer: bool = False,
-        knowledge_files: list[str] = None,
+        knowledge_files: list[str] | None = None,
         # Audio settings
         mic_gain: float = 3.0,
         chunk_size: int = 512,
@@ -129,30 +124,14 @@ class GeminiLiveHandler:
         jpeg_quality: int = 50,
         camera_width: int = 640,
     ):
-        """Initialize the Gemini Live handler.
-
-        Args:
-            api_key: Google API key
-            robot: ReachyMini instance
-            movement_controller: Controller for robot movements
-            use_camera: Whether to enable camera/vision capabilities
-            use_robot_audio: Whether to use Reachy Mini's mic/speaker instead of local
-            holiday_cheer: Whether to enable holiday cheer mode
-            mic_gain: Microphone gain multiplier
-            chunk_size: Audio chunk size in samples
-            send_queue_size: Output queue size
-            recv_queue_size: Input queue size
-            camera_fps: Frames per second for camera
-            jpeg_quality: JPEG compression quality
-            camera_width: Max camera frame width
-        """
+        """Initialize the Gemini Live handler."""
         self.robot = robot
         self.movement_controller = movement_controller
         self.use_camera = use_camera
         self.use_robot_audio = use_robot_audio
         self.holiday_cheer = holiday_cheer
         self.knowledge_files = knowledge_files or []
-        self.uploaded_files = []
+        self.uploaded_files: list[Any] = []
 
         # Configurable audio settings
         self.mic_gain = mic_gain
@@ -166,10 +145,10 @@ class GeminiLiveHandler:
         self.camera_width = camera_width
 
         # Initialize facial recognition state
-        self.known_face_encodings = []
-        self.known_face_names = []
-        self.last_greeted_person = None
-        self.last_greeting_time = 0
+        self.known_face_encodings: list[np.ndarray] = []
+        self.known_face_names: list[str] = []
+        self.last_greeted_person: str | None = None
+        self.last_greeting_time = 0.0
         self._load_known_faces()
         self.camera_lock = asyncio.Lock()
 
@@ -187,27 +166,27 @@ class GeminiLiveHandler:
         )
 
         # Audio setup (PyAudio for local, or robot hardware)
-        self.pya = None
-        self.audio_stream: Optional[object] = None
+        self.pya: Any = None
+        self.audio_stream: Any = None
 
-        if not use_robot_audio and PYAUDIO_AVAILABLE:
+        if not use_robot_audio and PYAUDIO_AVAILABLE and pyaudio is not None:
             self.pya = pyaudio.PyAudio()
         elif not use_robot_audio and not PYAUDIO_AVAILABLE:
             logger.warning("PyAudio not available, falling back to robot audio")
             self.use_robot_audio = True
 
         # Session and queues
-        self.session = None
-        self.audio_in_queue: Optional[asyncio.Queue] = None
-        self.out_queue: Optional[asyncio.Queue] = None
+        self.session: Any = None
+        self.audio_in_queue: asyncio.Queue[bytes] | None = None
+        self.out_queue: asyncio.Queue[str | dict[str, Any]] | None = None
 
         # Camera frame rate control
-        self.last_frame_time = 0
+        self.last_frame_time = 0.0
 
         # Define tools for the model
         self.tools = self._create_tools()
 
-    def _create_tools(self) -> list:
+    def _create_tools(self) -> list[types.Tool]:
         """Create function tools for the model."""
         move_head_tool = types.FunctionDeclaration(
             name="move_head",
@@ -481,11 +460,19 @@ class GeminiLiveHandler:
             logger.info(f"Uploading {file_path} to Gemini...")
             uploaded_file = self.client.files.upload(file=file_path)
 
+            assert uploaded_file is not None
+            assert uploaded_file.state is not None
+            assert uploaded_file.name is not None
+
             # Wait for Google's servers to process the PDF
             while uploaded_file.state.name == "PROCESSING":
                 logger.info(f"Waiting for {file_path} to process...")
                 time.sleep(2)
                 uploaded_file = self.client.files.get(name=uploaded_file.name)
+
+                assert uploaded_file is not None
+                assert uploaded_file.state is not None
+                assert uploaded_file.name is not None
 
             if uploaded_file.state.name == "FAILED":
                 logger.error(f"Failed to process file: {file_path}")
@@ -511,7 +498,7 @@ class GeminiLiveHandler:
             except Exception as e:
                 logger.error(f"Error extracting text from {file_path}: {e}")
 
-    async def _handle_tool_call(self, tool_call) -> str:
+    async def _handle_tool_call(self, tool_call: Any) -> str:
         """Handle a function call from the model."""
         name = tool_call.name
         args = dict(tool_call.args) if tool_call.args else {}
@@ -598,21 +585,27 @@ class GeminiLiveHandler:
 
     async def _listen_audio_local(self) -> None:
         """Capture audio from local microphone using PyAudio."""
-        # Initialize PyAudio if not already done
+        assert pyaudio is not None
+        
         if self.pya is None:
             if not PYAUDIO_AVAILABLE:
                 logger.error("PyAudio not available and robot audio not working")
                 return
             self.pya = pyaudio.PyAudio()
 
+        # Local Binding: prevent type narrowing loss across await
+        out_q = self.out_queue
+        assert self.pya is not None
+        assert out_q is not None
+
         mic_info = self.pya.get_default_input_device_info()
         self.audio_stream = await asyncio.to_thread(
             self.pya.open,
-            format=pyaudio.paInt16,
+            format=pyaudio.paInt16,  # type: ignore[attr-defined]
             channels=CHANNELS,
             rate=SEND_SAMPLE_RATE,
             input=True,
-            input_device_index=mic_info["index"],
+            input_device_index=int(mic_info["index"]),
             frames_per_buffer=self.chunk_size,
         )
 
@@ -622,45 +615,40 @@ class GeminiLiveHandler:
             data = await asyncio.to_thread(
                 self.audio_stream.read, self.chunk_size, **kwargs
             )
-            await self.out_queue.put({"data": data, "mime_type": "audio/pcm"})
+            await out_q.put({"data": data, "mime_type": "audio/pcm"})
 
     async def _listen_audio_robot(self) -> None:
         """Capture audio from Reachy Mini's microphone."""
-        # Check if audio is actually available
         if not hasattr(self.robot.media, "audio") or self.robot.media.audio is None:
             logger.warning("Robot audio not available, falling back to local audio")
             self.use_robot_audio = False
             await self._listen_audio_local()
             return
 
+        # Local Binding
+        out_q = self.out_queue
+        assert out_q is not None
+
         logger.info("Starting Reachy Mini microphone recording...")
         await asyncio.to_thread(self.robot.media.start_recording)
 
-        # Audio gain from config
         mic_gain = self.mic_gain
 
         while True:
             try:
-                # Get audio sample from robot (bytes or numpy array)
                 sample = await asyncio.to_thread(self.robot.media.get_audio_sample)
 
                 if sample is None:
                     await asyncio.sleep(0.005)
                     continue
 
-                # Convert to bytes if numpy array
                 if isinstance(sample, np.ndarray):
-                    # Robot sends stereo float32, convert to mono
                     if sample.dtype == np.float32:
-                        # If stereo (shape is (N, 2)), convert to mono
                         if len(sample.shape) == 2 and sample.shape[1] == 2:
                             sample = np.mean(sample, axis=1)
 
-                        # Apply gain and clip to prevent distortion
                         sample = sample * mic_gain
                         sample = np.clip(sample, -1.0, 1.0)
-
-                        # Convert to int16 PCM
                         sample = (sample * 32767).astype(np.int16)
                     data = sample.tobytes()
                 else:
@@ -668,14 +656,13 @@ class GeminiLiveHandler:
 
                 if data:
                     try:
-                        self.out_queue.put_nowait(
+                        out_q.put_nowait(
                             {"data": data, "mime_type": "audio/pcm"}
                         )
                     except asyncio.QueueFull:
-                        # Drop old audio to keep stream fresh
                         try:
-                            self.out_queue.get_nowait()
-                            self.out_queue.put_nowait(
+                            out_q.get_nowait()
+                            out_q.put_nowait(
                                 {"data": data, "mime_type": "audio/pcm"}
                             )
                         except Exception:
@@ -688,58 +675,65 @@ class GeminiLiveHandler:
     async def _learn_new_face(self, name: str) -> str:
         """Capture a frame, extract face encodings, and save the profile."""
         logger.info(f"Attempting to learn new face for {name}")
-        
-        if not self.use_camera or not hasattr(self.robot.media, "camera") or self.robot.media.camera is None:
+
+        if (
+            not self.use_camera
+            or not hasattr(self.robot.media, "camera")
+            or self.robot.media.camera is None
+        ):
             return "Error: Camera is disabled or unavailable. I cannot take a photo."
-            
+
         try:
-            # Capture the current frame
             async with self.camera_lock:
                 frame = await asyncio.to_thread(self.robot.media.get_frame)
 
             if frame is None:
                 return "Error: Failed to capture image from the camera. The hardware might be busy."
-                
-            # Ensure the storage directory exists
+
             faces_dir = "known_faces"
             os.makedirs(faces_dir, exist_ok=True)
-            
-            # Convert BGR (OpenCV) to RGB (required by face_recognition)
+
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            
-            # Isolate biometric data
-            face_locations = await asyncio.to_thread(face_recognition.face_locations, rgb_frame)
-            encodings = await asyncio.to_thread(face_recognition.face_encodings, rgb_frame, face_locations)
-            
-            # Failsafe: Prevent saving images where the face is obscured or missing
+
+            face_locations = await asyncio.to_thread(
+                face_recognition.face_locations, rgb_frame
+            )
+            encodings = await asyncio.to_thread(
+                face_recognition.face_encodings, rgb_frame, face_locations
+            )
+
             if not encodings:
                 return f"Error: I couldn't detect a clear face in the frame. Please ask {name} to look directly at the camera, ensure they are well-lit, and try again."
-                
-            # Write to disk
+
             filepath = os.path.join(faces_dir, f"{name}.jpg")
             cv2.imwrite(filepath, frame)
-            
-            # Dynamically update the application's runtime state
+
             self.known_face_encodings.append(encodings[0])
             self.known_face_names.append(name)
-            
+
             logger.info(f"Successfully learned and stored biometric vector for {name}.")
-            return f"Success! I have learned the face for {name} and saved their profile."
-            
+            return (
+                f"Success! I have learned the face for {name} and saved their profile."
+            )
+
         except Exception as e:
             logger.error(f"Error during face learning: {e}")
             return f"Error: An unexpected exception occurred while processing the photo: {e}"
+
     async def send_realtime(self) -> None:
         """Send queued audio/data to Gemini."""
+        # Local Binding
+        out_q = self.out_queue
+        session = self.session
+        assert out_q is not None
+        assert session is not None
+
         while True:
-            msg = await self.out_queue.get()
-            # Type differentiation logic
+            msg = await out_q.get()
             if isinstance(msg, str):
-                # The SDK automatically serializes raw strings into Text Parts
-                await self.session.send(input=msg, end_of_turn=True)
+                await session.send(input=msg, end_of_turn=True)
             elif isinstance(msg, dict):
-                # Standard audio/video raw byte dictionaries
-                await self.session.send(input=msg)
+                await session.send(input=cast(Any, msg))
             else:
                 logger.warning(
                     f"Unrecognized message type in output queue: {type(msg)}"
@@ -747,37 +741,38 @@ class GeminiLiveHandler:
 
     async def receive_audio(self) -> None:
         """Receive responses from Gemini and handle them."""
+        # Local Binding
+        session = self.session
+        in_q = self.audio_in_queue
+        assert session is not None
+        assert in_q is not None
+
         while True:
             try:
-                turn = self.session.receive()
+                turn = session.receive()
                 async for response in turn:
-                    # Handle audio data
                     if data := response.data:
                         try:
-                            self.audio_in_queue.put_nowait(data)
+                            in_q.put_nowait(data)
                         except asyncio.QueueFull:
-                            # Drop oldest audio to make room
                             try:
-                                self.audio_in_queue.get_nowait()
-                                self.audio_in_queue.put_nowait(data)
+                                in_q.get_nowait()
+                                in_q.put_nowait(data)
                             except Exception:
                                 pass
                         continue
 
-                    # Handle text (print transcription)
                     if hasattr(response, "text") and response.text:
                         print(response.text, end="", flush=True)
 
-                    # Handle tool calls
                     if hasattr(response, "tool_call") and response.tool_call:
                         for fc in response.tool_call.function_calls:
                             logger.debug(f"Processing tool call: {fc.name}")
                             result = await self._handle_tool_call(fc)
                             logger.debug(f"Tool result: {result}")
 
-                            # Send tool response back to Gemini
                             try:
-                                await self.session.send(
+                                await session.send(
                                     input=types.LiveClientToolResponse(
                                         function_responses=[
                                             types.FunctionResponse(
@@ -791,11 +786,9 @@ class GeminiLiveHandler:
                             except Exception as e:
                                 logger.error(f"Failed to send tool response: {e}")
 
-                # Only clear queue if user interrupted (queue is full)
-                # This prevents cutting off normal responses
-                if self.audio_in_queue.qsize() > self.recv_queue_size - 2:
-                    while not self.audio_in_queue.empty():
-                        self.audio_in_queue.get_nowait()
+                if in_q.qsize() > self.recv_queue_size - 2:
+                    while not in_q.empty():
+                        in_q.get_nowait()
 
             except Exception as e:
                 logger.warning(f"Receive audio error: {e}")
@@ -810,56 +803,60 @@ class GeminiLiveHandler:
 
     async def _play_audio_local(self) -> None:
         """Play audio through local speakers using PyAudio."""
-        # Initialize PyAudio if not already done
+        assert pyaudio is not None
+        
+        # Local Binding
+        in_q = self.audio_in_queue
+        assert in_q is not None
+
         if self.pya is None:
             if not PYAUDIO_AVAILABLE:
                 logger.error("PyAudio not available and robot audio not working")
-                # Just drain the queue to avoid blocking
                 while True:
-                    await self.audio_in_queue.get()
+                    await in_q.get()
                 return
             self.pya = pyaudio.PyAudio()
 
+        assert self.pya is not None
         stream = await asyncio.to_thread(
             self.pya.open,
-            format=pyaudio.paInt16,
+            format=pyaudio.paInt16,  # type: ignore[attr-defined]
             channels=CHANNELS,
             rate=RECEIVE_SAMPLE_RATE,
             output=True,
         )
         while True:
-            bytestream = await self.audio_in_queue.get()
+            bytestream = await in_q.get()
             await asyncio.to_thread(stream.write, bytestream)
 
     async def _play_audio_robot(self) -> None:
         """Play audio through Reachy Mini's speaker."""
-        # Check if audio is actually available
         if not hasattr(self.robot.media, "audio") or self.robot.media.audio is None:
             logger.warning("Robot speaker not available, falling back to local audio")
             self.use_robot_audio = False
             await self._play_audio_local()
             return
 
+        # Local Binding
+        in_q = self.audio_in_queue
+        assert in_q is not None
+
         logger.info("Starting Reachy Mini speaker playback...")
         await asyncio.to_thread(self.robot.media.start_playing)
 
-        # Robot expects 16kHz, Gemini sends 24kHz
         ROBOT_SAMPLE_RATE = 16000
 
         while True:
             try:
-                bytestream = await self.audio_in_queue.get()
+                bytestream = await in_q.get()
 
-                # Convert bytes to numpy float32 array for robot speaker
-                # Input is 16-bit PCM at 24kHz
                 audio_int16 = np.frombuffer(bytestream, dtype=np.int16)
                 audio_float32 = audio_int16.astype(np.float32) / 32767.0
 
-                # Resample from 24kHz to 16kHz
                 num_samples = int(
                     len(audio_float32) * ROBOT_SAMPLE_RATE / RECEIVE_SAMPLE_RATE
                 )
-                audio_resampled = signal.resample(audio_float32, num_samples)
+                audio_resampled = cast(np.ndarray, signal.resample(audio_float32, num_samples))
 
                 await asyncio.to_thread(
                     self.robot.media.push_audio_sample,
@@ -873,42 +870,36 @@ class GeminiLiveHandler:
     async def stream_camera(self) -> None:
         """Stream camera frames to Gemini."""
         if not self.use_camera:
-            # Keep task alive but do nothing
             while True:
                 await asyncio.sleep(10)
             return
 
-        # Check if camera is actually available
         if not hasattr(self.robot.media, "camera") or self.robot.media.camera is None:
             logger.warning("Robot camera not available, disabling camera streaming")
             self.use_camera = False
-            # Keep task alive
             while True:
                 await asyncio.sleep(10)
             return
 
-        logger.info("Starting camera streaming...")
+        # Local Binding
+        out_q = self.out_queue
+        assert out_q is not None
 
-        # Wait for WebRTC to establish before checking camera
+        logger.info("Starting camera streaming...")
         await asyncio.sleep(3.0)
 
-        # Track consecutive failures to avoid spam
         consecutive_failures = 0
-        max_failures = 30  # Give more time for WebRTC camera stream
-
+        max_failures = 30  
         frame_count = 0
-        FACE_CHECK_INTERVAL = int(self.camera_fps * 2)  # Check roughly every 2 seconds
+        FACE_CHECK_INTERVAL = int(self.camera_fps * 2)  
 
         while True:
             try:
                 current_time = time.time()
-
-                # Rate limit camera frames
                 if current_time - self.last_frame_time < (1.0 / self.camera_fps):
                     await asyncio.sleep(0.05)
                     continue
 
-                # Get frame from robot camera
                 async with self.camera_lock:
                     frame = await asyncio.to_thread(self.robot.media.get_frame)
 
@@ -927,11 +918,9 @@ class GeminiLiveHandler:
 
                 frame_count += 1
                 if self.known_face_encodings and frame_count % FACE_CHECK_INTERVAL == 0:
-                    # Downscale for performance
                     small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
                     rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
 
-                    # Detect and encode
                     face_locations = await asyncio.to_thread(
                         face_recognition.face_locations, rgb_small_frame
                     )
@@ -947,7 +936,6 @@ class GeminiLiveHandler:
                             first_match_index = matches.index(True)
                             name = self.known_face_names[first_match_index]
 
-                            # Debounce greetings (e.g., don't greet the same person more than once every 60 seconds)
                             if name != self.last_greeted_person or (
                                 current_time - self.last_greeting_time > 60
                             ):
@@ -957,30 +945,25 @@ class GeminiLiveHandler:
                                 self.last_greeted_person = name
                                 self.last_greeting_time = current_time
 
-                                # Inject explicit context into the Gemini session
                                 alert_msg = f"[SYSTEM DIRECTIVE: {name} is now standing in front of you. You MUST execute a verbal greeting immediately, and you MUST explicitly speak the name '{name}' in your greeting.]"
 
-                                # Put in send queue, bypassing the standard audio/video dict format
                                 try:
-                                    self.out_queue.put_nowait(alert_msg)
+                                    out_q.put_nowait(alert_msg)
                                 except asyncio.QueueFull:
                                     pass
 
-                # Resize frame for efficiency
                 h, w = frame.shape[:2]
                 if w > self.camera_width:
                     scale = self.camera_width / w
                     frame = cv2.resize(frame, (self.camera_width, int(h * scale)))
 
-                # Encode as JPEG with configurable quality
                 _, buffer = cv2.imencode(
                     ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, self.jpeg_quality]
                 )
                 image_bytes = buffer.tobytes()
 
-                # Send to Gemini (non-blocking, skip if queue full)
                 try:
-                    self.out_queue.put_nowait(
+                    out_q.put_nowait(
                         {"data": image_bytes, "mime_type": "image/jpeg"}
                     )
                     logger.debug(f"Sent camera frame ({len(image_bytes)} bytes)")
@@ -993,14 +976,9 @@ class GeminiLiveHandler:
                 await asyncio.sleep(0.5)
 
     async def run(self, stop_event: threading.Event) -> None:
-        """Run the conversation loop with auto-reconnection.
-
-        Args:
-            stop_event: Event to signal when to stop
-        """
+        """Run the conversation loop with auto-reconnection."""
         self._upload_knowledge_files()
 
-        # Select system instruction based on holiday mode
         system_instruction = (
             HOLIDAY_SYSTEM_INSTRUCTION if self.holiday_cheer else SYSTEM_INSTRUCTION
         )
@@ -1017,15 +995,15 @@ class GeminiLiveHandler:
             )
 
         config = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            media_resolution="MEDIA_RESOLUTION_MEDIUM",
+            response_modalities=[types.Modality.AUDIO],
+            media_resolution=types.MediaResolution.MEDIA_RESOLUTION_MEDIUM,
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
                 )
             ),
             system_instruction=types.Content(
-                parts=sys_parts  # <--- Modified
+                parts=sys_parts  
             ),
             tools=self.tools,
         )
@@ -1056,17 +1034,14 @@ class GeminiLiveHandler:
                         )
                         print("Press Ctrl+C to stop.\n")
 
-                    # Start all tasks
                     tg.create_task(self.send_realtime())
                     tg.create_task(self.listen_audio())
                     tg.create_task(self.receive_audio())
                     tg.create_task(self.play_audio())
 
-                    # Start camera streaming if enabled
                     if self.use_camera:
                         tg.create_task(self.stream_camera())
 
-                    # Wait for stop signal
                     while not stop_event.is_set():
                         await asyncio.sleep(0.1)
 
@@ -1074,13 +1049,11 @@ class GeminiLiveHandler:
 
             except asyncio.CancelledError:
                 break
-            except ExceptionGroup as EG:
+            except ExceptionGroup as EG:  # type: ignore[name-defined] # noqa: F821
                 await self._cleanup_streams()
-                # Log what caused the exception group
-                for exc in EG.exceptions:
+                for exc in EG.exceptions: # type: ignore[name-defined]
                     logger.warning(f"Task exception: {type(exc).__name__}: {exc}")
                     logger.debug(traceback.format_exception(exc))
-                # Check if it's a connection error - reconnect
                 logger.warning("Connection lost, reconnecting in 2 seconds...")
                 print("\n⚠️ Connection lost. Reconnecting...\n")
                 await asyncio.sleep(2)
@@ -1095,8 +1068,9 @@ class GeminiLiveHandler:
         """Clean up audio streams."""
         if self.audio_stream:
             try:
-                if hasattr(self.audio_stream, "close"):
-                    self.audio_stream.close()
+                stream = cast(Any, self.audio_stream)
+                if hasattr(stream, "close"):
+                    stream.close()
             except Exception:
                 pass
             self.audio_stream = None
