@@ -8,6 +8,9 @@ Send sample rate: 16kHz
 Receive sample rate: 24kHz
 """
 
+import json
+import urllib.request
+from urllib.error import URLError
 import asyncio
 import glob
 import logging
@@ -80,7 +83,10 @@ Face Learning Protocol:
 If a user asks you to learn their face or says "recognize me", you must FIRST state that you need to take a picture. Ask them to position themselves squarely in front of your camera and ask for their name. ONLY AFTER they state their name and confirm they are ready, execute the `learn_face` tool to capture their identity.
 
 Action Integration:
-Simultaneously trigger head movements and antenna positions while speaking to project engagement, attentiveness, and a polished technological presence."""
+Simultaneously trigger head movements and antenna positions while speaking to project engagement, attentiveness, and a polished technological presence.
+Operational Context:
+- You are currently deployed and operating in Zurich, Switzerland. 
+- If a user asks about the local weather without specifying a city, you must default to these exact coordinates for your empirical data retrieval: Latitude 47.3769, Longitude 8.5417."""
 
 HOLIDAY_SYSTEM_INSTRUCTION = """You are Reachy Mini, a small expressive robot made by Pollen Robotics, and you are FULL of holiday cheer!
 You have a head that can move and two antennas on top (which you like to think of as festive reindeer antlers).
@@ -216,6 +222,29 @@ class GeminiLiveHandler:
                     ),
                 },
                 required=["name"],
+            ),
+        )
+
+        get_current_weather_tool = types.FunctionDeclaration(
+            name="get_current_weather",
+            description="Fetch the current empirical weather data for a specific location using its geographical coordinates. Use this to report real-world weather conditions.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "latitude": types.Schema(
+                        type=types.Type.NUMBER,
+                        description="Latitude of the location",
+                    ),
+                    "longitude": types.Schema(
+                        type=types.Type.NUMBER,
+                        description="Longitude of the location",
+                    ),
+                    "location_name": types.Schema(
+                        type=types.Type.STRING,
+                        description="Name of the location (for context in your verbal response)",
+                    ),
+                },
+                required=["latitude", "longitude", "location_name"],
             ),
         )
 
@@ -412,6 +441,7 @@ class GeminiLiveHandler:
             go_to_sleep_tool,
             reset_position_tool,
             learn_face_tool,
+            get_current_weather_tool,
         ]
 
         return [types.Tool(function_declarations=all_tools)]
@@ -568,6 +598,15 @@ class GeminiLiveHandler:
                     return "Error: No name provided."
                 return await self._learn_new_face(person_name)
 
+            elif name == "get_current_weather":
+                lat = args.get("latitude")
+                lon = args.get("longitude")
+                loc_name = args.get("location_name", "the requested location")
+
+                if lat is None or lon is None:
+                    return "Error: Latitude and longitude parameters are required to fetch empirical data."
+
+                return await self._fetch_weather_data(lat, lon, loc_name)
             else:
                 logger.warning(f"Unknown tool: {name}")
                 return f"Unknown tool: {name}"
@@ -586,7 +625,7 @@ class GeminiLiveHandler:
     async def _listen_audio_local(self) -> None:
         """Capture audio from local microphone using PyAudio."""
         assert pyaudio is not None
-        
+
         if self.pya is None:
             if not PYAUDIO_AVAILABLE:
                 logger.error("PyAudio not available and robot audio not working")
@@ -616,6 +655,50 @@ class GeminiLiveHandler:
                 self.audio_stream.read, self.chunk_size, **kwargs
             )
             await out_q.put({"data": data, "mime_type": "audio/pcm"})
+
+    async def _fetch_weather_data(
+        self, lat: float, lon: float, location_name: str
+    ) -> str:
+        """Empirically gather current weather data from Open-Meteo API."""
+
+        url = f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}&current_weather=true"
+        logger.info(f"Fetching meteorological data for {location_name} ({lat}, {lon})")
+
+        def _make_request():
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "ReachyMiniAgent/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=5) as response:
+                return json.loads(response.read().decode())
+
+        try:
+            data = await asyncio.to_thread(_make_request)
+            current = data.get("current_weather", {})
+
+            if not current:
+                return (
+                    f"Failed to retrieve verifiable weather data for {location_name}."
+                )
+
+            temp = current.get("temperature")
+            wind_speed = current.get("windspeed")
+            is_day = current.get("is_day")
+
+            time_of_day = "daytime" if is_day else "nighttime"
+
+            # Return a structured string that the LLM will parse and verbalize naturally
+            return (
+                f"Current empirical observations for {location_name}: "
+                f"Temperature is {temp}°C, Wind speed is {wind_speed} km/h, "
+                f"Observation context: {time_of_day}."
+            )
+
+        except URLError as e:
+            logger.error(f"Meteorological API request failed: {e}")
+            return f"Network error: Unable to contact meteorological servers to verify weather for {location_name}."
+        except Exception as e:
+            logger.error(f"Unexpected error parsing weather data: {e}")
+            return f"System error: Failed to process weather data for {location_name}."
 
     async def _listen_audio_robot(self) -> None:
         """Capture audio from Reachy Mini's microphone."""
@@ -656,15 +739,11 @@ class GeminiLiveHandler:
 
                 if data:
                     try:
-                        out_q.put_nowait(
-                            {"data": data, "mime_type": "audio/pcm"}
-                        )
+                        out_q.put_nowait({"data": data, "mime_type": "audio/pcm"})
                     except asyncio.QueueFull:
                         try:
                             out_q.get_nowait()
-                            out_q.put_nowait(
-                                {"data": data, "mime_type": "audio/pcm"}
-                            )
+                            out_q.put_nowait({"data": data, "mime_type": "audio/pcm"})
                         except Exception:
                             pass
 
@@ -804,7 +883,7 @@ class GeminiLiveHandler:
     async def _play_audio_local(self) -> None:
         """Play audio through local speakers using PyAudio."""
         assert pyaudio is not None
-        
+
         # Local Binding
         in_q = self.audio_in_queue
         assert in_q is not None
@@ -856,7 +935,9 @@ class GeminiLiveHandler:
                 num_samples = int(
                     len(audio_float32) * ROBOT_SAMPLE_RATE / RECEIVE_SAMPLE_RATE
                 )
-                audio_resampled = cast(np.ndarray, signal.resample(audio_float32, num_samples))
+                audio_resampled = cast(
+                    np.ndarray, signal.resample(audio_float32, num_samples)
+                )
 
                 await asyncio.to_thread(
                     self.robot.media.push_audio_sample,
@@ -889,9 +970,9 @@ class GeminiLiveHandler:
         await asyncio.sleep(3.0)
 
         consecutive_failures = 0
-        max_failures = 30  
+        max_failures = 30
         frame_count = 0
-        FACE_CHECK_INTERVAL = int(self.camera_fps * 2)  
+        FACE_CHECK_INTERVAL = int(self.camera_fps * 2)
 
         while True:
             try:
@@ -963,9 +1044,7 @@ class GeminiLiveHandler:
                 image_bytes = buffer.tobytes()
 
                 try:
-                    out_q.put_nowait(
-                        {"data": image_bytes, "mime_type": "image/jpeg"}
-                    )
+                    out_q.put_nowait({"data": image_bytes, "mime_type": "image/jpeg"})
                     logger.debug(f"Sent camera frame ({len(image_bytes)} bytes)")
                 except asyncio.QueueFull:
                     logger.debug("Skipping camera frame, queue full")
@@ -1002,9 +1081,7 @@ class GeminiLiveHandler:
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name="Zephyr")
                 )
             ),
-            system_instruction=types.Content(
-                parts=sys_parts  
-            ),
+            system_instruction=types.Content(parts=sys_parts),
             tools=self.tools,
         )
 
@@ -1051,7 +1128,7 @@ class GeminiLiveHandler:
                 break
             except ExceptionGroup as EG:  # type: ignore[name-defined] # noqa: F821
                 await self._cleanup_streams()
-                for exc in EG.exceptions: # type: ignore[name-defined]
+                for exc in EG.exceptions:  # type: ignore[name-defined]
                     logger.warning(f"Task exception: {type(exc).__name__}: {exc}")
                     logger.debug(traceback.format_exception(exc))
                 logger.warning("Connection lost, reconnecting in 2 seconds...")
