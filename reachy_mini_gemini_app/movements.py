@@ -12,9 +12,20 @@ import numpy as np
 
 from reachy_mini import ReachyMini
 from reachy_mini.utils import create_head_pose
+import functools
 
 logger = logging.getLogger(__name__)
 
+def pause_tracking(func):
+    """Decorator to preempt continuous tracking during discrete animations."""
+    @functools.wraps(func)
+    async def wrapper(self, *args, **kwargs):
+        self.is_animating = True
+        try:
+            return await func(self, *args, **kwargs)
+        finally:
+            self.is_animating = False
+    return wrapper
 
 class MovementController:
     """Controls Reachy Mini head movements and expressions."""
@@ -29,6 +40,8 @@ class MovementController:
         self.current_roll = 0.0
         self.current_pitch = 0.0
         self.current_yaw = 0.0
+
+        self.is_animating = False
 
     async def _goto_target(
         self,
@@ -150,40 +163,44 @@ class MovementController:
         await self._goto_target(antennas=[right_rad, left_rad], duration=duration)
         return f"Moved antennas to right={right_angle}, left={left_angle} degrees"
 
-
-    async def track_face_in_image(self, face_x: float, face_y: float, img_w: int, img_h: int) -> None:
+    async def track_face_in_image(
+        self, face_x: float, face_y: float, img_w: int, img_h: int
+    ) -> None:
         """Apply proportional control to center a detected face in the camera view."""
+        if self.is_animating:
+            return
         cx = img_w / 2.0
         cy = img_h / 2.0
-        
+
         # Calculate normalized error (-1.0 to 1.0)
         err_x = (face_x - cx) / cx
         err_y = (face_y - cy) / cy
-        
+
         # Deadzone: Ignore minor deviations to prevent mechanical jitter
         if abs(err_x) < 0.15 and abs(err_y) < 0.15:
             return
-            
+
         # Proportional gains (tuning parameters based on camera FOV)
         p_yaw = 15.0
         p_pitch = 10.0
-        
+
         self.current_yaw -= err_x * p_yaw
         self.current_pitch += err_y * p_pitch
-        
+
         # Clamp bounds to prevent hyper-extension
         self.current_yaw = max(-45.0, min(45.0, self.current_yaw))
         self.current_pitch = max(-30.0, min(30.0, self.current_pitch))
-        
+
         pose = create_head_pose(
             roll=self.current_roll,
             pitch=self.current_pitch,
             yaw=self.current_yaw,
             degrees=True,
         )
-        
+
         # Execute rapid adjustment (0.2s) for responsive tracking
         await self._goto_target(head=pose, duration=0.2)
+
     async def antenna_expression(self, expression: str) -> str:
         """Set antennas to a preset expression.
 
@@ -209,6 +226,7 @@ class MovementController:
         await self._goto_target(antennas=antennas, duration=0.3)
         return f"Set antennas to {expression}"
 
+    @pause_tracking
     async def nod_yes(self, times: int = 2) -> str:
         """Nod head up and down (yes gesture).
 
@@ -237,6 +255,7 @@ class MovementController:
         await self._goto_target(head=pose, duration=0.2)
         return f"Nodded yes {times} times"
 
+    @pause_tracking
     async def shake_no(self, times: int = 2) -> str:
         """Shake head left and right (no gesture).
 
@@ -265,6 +284,7 @@ class MovementController:
         await self._goto_target(head=pose, duration=0.2)
         return f"Shook head no {times} times"
 
+    @pause_tracking
     async def tilt_head(self, direction: str, angle: float = 20) -> str:
         """Tilt head to one side (curious/quizzical gesture).
 
@@ -312,6 +332,7 @@ class MovementController:
             logger.error(f"Sleep error: {e}")
             return f"Sleep failed: {e}"
 
+    @pause_tracking
     async def express_emotion(self, emotion: str) -> str:
         """Express an emotion through movement.
 
@@ -477,6 +498,7 @@ class MovementController:
         pose = create_head_pose(degrees=True)
         await self._goto_target(head=pose, antennas=[0.2, -0.2], duration=0.3)
 
+    @pause_tracking
     async def do_dance(self, style: str = "default") -> str:
         """Perform a short dance animation.
 
