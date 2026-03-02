@@ -156,8 +156,8 @@ class GeminiLiveHandler:
         # Initialize facial recognition state
         self.known_face_encodings: list[np.ndarray] = []
         self.known_face_names: list[str] = []
-        self.last_greeted_person: str | None = None
-        self.last_greeting_time = 0.0
+        self.greeting_cooldowns: dict[str, float] = {}
+        self.greeting_timeout_seconds = 300.0  # 5 minute cooldown per individual
         self._load_known_faces()
         self.camera_lock = asyncio.Lock()
 
@@ -1168,14 +1168,16 @@ class GeminiLiveHandler:
                                     first_match_index = matches.index(True)
                                     name = self.known_face_names[first_match_index]
 
-                                    if name != self.last_greeted_person or (
-                                        current_time - self.last_greeting_time > 60
+                                    last_seen = self.greeting_cooldowns.get(name, 0.0)
+                                    if (
+                                        current_time - last_seen
+                                        > self.greeting_timeout_seconds
                                     ):
                                         logger.info(
-                                            f"Positive identification: {name}. Injecting context."
+                                            f"Positive identification: {name}. Cooldown expired. Injecting context."
                                         )
-                                        self.last_greeted_person = name
-                                        self.last_greeting_time = current_time
+                                        # Update the specific individual's timestamp
+                                        self.greeting_cooldowns[name] = current_time
 
                                         alert_msg = f"[SYSTEM DIRECTIVE: {name} is now standing in front of you. You MUST execute a verbal greeting immediately, and you MUST explicitly speak the name '{name}' in your greeting.]"
 
