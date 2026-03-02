@@ -136,8 +136,11 @@ class GeminiLiveHandler:
         self.use_camera = use_camera
         self.use_robot_audio = use_robot_audio
         self.holiday_cheer = holiday_cheer
+
         self.knowledge_files = knowledge_files or []
         self.uploaded_files: list[Any] = []
+        self.uploaded_knowledge_files: list[Any] = []
+        self.document_cache: Any = None  # Stores the pre-computed active memory cache
 
         # Configurable audio settings
         self.mic_gain = mic_gain
@@ -222,6 +225,21 @@ class GeminiLiveHandler:
                     ),
                 },
                 required=["name"],
+            ),
+        )
+
+        query_manual_tool = types.FunctionDeclaration(
+            name="query_technical_manual",
+            description="Query the uploaded 400-page reference manual for specific information. Use this whenever the user asks a question requiring deep, specific knowledge from the provided documentation.",
+            parameters=types.Schema(
+                type=types.Type.OBJECT,
+                properties={
+                    "search_query": types.Schema(
+                        type=types.Type.STRING,
+                        description="A highly specific question or search term to look up in the manual.",
+                    ),
+                },
+                required=["search_query"],
             ),
         )
 
@@ -442,6 +460,7 @@ class GeminiLiveHandler:
             reset_position_tool,
             learn_face_tool,
             get_current_weather_tool,
+            query_manual_tool,
         ]
 
         return [types.Tool(function_declarations=all_tools)]
@@ -475,11 +494,11 @@ class GeminiLiveHandler:
                 logger.error(f"Failed to process reference image {image_path}: {e}")
 
     def _upload_knowledge_files(self) -> None:
-        """Upload documents, wait for processing, and extract text content."""
+        """Upload documents and store references for asynchronous tool retrieval."""
+        self.uploaded_knowledge_files = []
         if not self.knowledge_files:
             return
 
-        self.knowledge_text = ""
         logger.info(f"Processing {len(self.knowledge_files)} knowledge files...")
 
         for file_path in self.knowledge_files:
@@ -487,46 +506,48 @@ class GeminiLiveHandler:
                 logger.warning(f"Knowledge file not found: {file_path}")
                 continue
 
-            logger.info(f"Uploading {file_path} to Gemini...")
+            logger.info(f"Uploading {file_path} to Gemini File API...")
             uploaded_file = self.client.files.upload(file=file_path)
 
+            # Assertions to satisfy Pyright's Optional type checking
             assert uploaded_file is not None
-            assert uploaded_file.state is not None
             assert uploaded_file.name is not None
+            assert uploaded_file.state is not None
 
-            # Wait for Google's servers to process the PDF
             while uploaded_file.state.name == "PROCESSING":
-                logger.info(f"Waiting for {file_path} to process...")
                 time.sleep(2)
                 uploaded_file = self.client.files.get(name=uploaded_file.name)
-
+                # Re-assert after fetching the updated state
                 assert uploaded_file is not None
-                assert uploaded_file.state is not None
                 assert uploaded_file.name is not None
+                assert uploaded_file.state is not None
 
             if uploaded_file.state.name == "FAILED":
-                logger.error(f"Failed to process file: {file_path}")
+                logger.error(f"File processing failed: {file_path}")
                 continue
 
-            logger.info(f"Extracting text content from {file_path}...")
+            # Store the File object. It resides on Google's servers, costing zero local memory.
+            self.uploaded_knowledge_files.append(uploaded_file)
+            logger.info(f"Successfully mapped {file_path} for retrieval.")
+        # NEW LOGIC: Pre-compute the cache for low-latency retrieval
+        if self.uploaded_knowledge_files:
+            logger.info("Constructing active Context Cache for the manuals...")
             try:
-                # Use a standard unary API call to extract the text
-                extraction_response = self.client.models.generate_content(
+                self.document_cache = self.client.caches.create(
                     model="gemini-2.5-flash",
-                    contents=[
-                        uploaded_file,
-                        "Extract the full text content of this document verbatim. Preserve the logical structure, headings, and key details.",
-                    ],
+                    config=types.CreateCachedContentConfig(
+                        contents=self.uploaded_knowledge_files,
+                        system_instruction="You are an expert technical data extractor. You must extract concise, accurate answers strictly based on the provided reference documents.",
+                        ttl="3600s",  # Cache lives in active memory for 1 hour
+                    ),
                 )
-
-                if extraction_response.text:
-                    self.knowledge_text += f"\n\n--- Start of Document: {file_path} ---\n{extraction_response.text}\n--- End of Document ---\n"
-                    logger.info(f"Successfully extracted text from {file_path}")
-                else:
-                    logger.warning(f"No text extracted from {file_path}")
-
+                logger.info(
+                    f"Context Cache created successfully: {self.document_cache.name}"
+                )
             except Exception as e:
-                logger.error(f"Error extracting text from {file_path}: {e}")
+                logger.error(
+                    f"Failed to create Context Cache. Falling back to cold-queries: {e}"
+                )
 
     async def _handle_tool_call(self, tool_call: Any) -> str:
         """Handle a function call from the model."""
@@ -607,6 +628,13 @@ class GeminiLiveHandler:
                     return "Error: Latitude and longitude parameters are required to fetch empirical data."
 
                 return await self._fetch_weather_data(lat, lon, loc_name)
+
+            elif name == "query_technical_manual":
+                query = args.get("search_query")
+                if not query:
+                    return "Error: No search query provided."
+                return await self._execute_document_query(query)
+
             else:
                 logger.warning(f"Unknown tool: {name}")
                 return f"Unknown tool: {name}"
@@ -655,6 +683,41 @@ class GeminiLiveHandler:
                 self.audio_stream.read, self.chunk_size, **kwargs
             )
             await out_q.put({"data": data, "mime_type": "audio/pcm"})
+
+    async def _execute_document_query(self, query: str) -> str:
+        """Executes a low-latency generation call against the pre-computed Cache."""
+        if not self.uploaded_knowledge_files:
+            return "Error: No reference manuals are currently loaded into the system."
+
+        logger.info(f"Executing deep cache-accelerated search for: {query}")
+
+        def _run_query():
+            # If the cache was successfully built, use it.
+            if self.document_cache:
+                response = self.client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=f"Query: {query}",
+                    config=types.GenerateContentConfig(
+                        cached_content=self.document_cache.name
+                    )
+                )
+            # Fallback if cache creation failed
+            else:
+                response = self.client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[
+                        self.uploaded_knowledge_files[0],
+                        f"Extract a concise, accurate answer to the following query based strictly on the provided document. Query: {query}",
+                    ],
+                )
+            return response.text
+
+        try:
+            result = await asyncio.to_thread(_run_query)
+            return result if result else "No relevant information found in the manual."
+        except Exception as e:
+            logger.error(f"Document query failed: {e}")
+            return f"System error during document retrieval: {e}"
 
     async def _fetch_weather_data(
         self, lat: float, lon: float, location_name: str
@@ -1065,11 +1128,12 @@ class GeminiLiveHandler:
             logger.info("Holiday cheer mode enabled!")
 
         sys_parts = [types.Part.from_text(text=system_instruction)]
-        if hasattr(self, "knowledge_text") and self.knowledge_text:
+        if hasattr(self, "uploaded_knowledge_files") and self.uploaded_knowledge_files:
             sys_parts.append(
                 types.Part.from_text(
-                    text=f"\n\nYou have been provided with the following reference documents. "
-                    f"Use this information to answer the user's questions accurately:\n{self.knowledge_text}"
+                    text="\n\n[SYSTEM NOTICE: A technical reference manual has been loaded into your memory bank. "
+                    "You MUST use the `query_technical_manual` tool to search it whenever the user asks for "
+                    "specific technical details, instructions, or documentation.]"
                 )
             )
 
@@ -1163,11 +1227,19 @@ class GeminiLiveHandler:
                 pass
 
     async def close(self) -> None:
-        """Clean up resources."""
+        """Clean up resources and active caches."""
         await self._cleanup_streams()
 
         if self.pya:
             self.pya.terminate()
             self.pya = None
+            
+        # Destroy the active memory cache to halt billing
+        if getattr(self, "document_cache", None):
+            try:
+                self.client.caches.delete(name=self.document_cache.name)
+                logger.info("Context Cache successfully purged from active memory.")
+            except Exception as e:
+                logger.warning(f"Failed to delete Context Cache: {e}")
 
         logger.info("Gemini handler closed")
