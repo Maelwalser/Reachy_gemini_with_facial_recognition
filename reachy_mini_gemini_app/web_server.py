@@ -6,7 +6,7 @@ import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from typing import Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 from reachy_mini_gemini_app.config import get_settings_for_api, save_settings
 

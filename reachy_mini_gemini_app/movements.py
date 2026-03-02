@@ -6,7 +6,7 @@ can use as tools during conversation.
 
 import asyncio
 import logging
-from typing import Optional, Tuple
+from typing import Optional
 
 import numpy as np
 
@@ -26,6 +26,9 @@ class MovementController:
             robot: ReachyMini instance to control
         """
         self.robot = robot
+        self.current_roll = 0.0
+        self.current_pitch = 0.0
+        self.current_yaw = 0.0
 
     async def _goto_target(
         self,
@@ -60,11 +63,11 @@ class MovementController:
         """
         # Define head poses for each direction (roll, pitch, yaw in degrees)
         poses = {
-            "left": (0, 0, 25),      # yaw left
-            "right": (0, 0, -25),    # yaw right
-            "up": (0, -20, 0),       # pitch up
-            "down": (0, 20, 0),      # pitch down
-            "center": (0, 0, 0),     # neutral
+            "left": (0, 0, 25),  # yaw left
+            "right": (0, 0, -25),  # yaw right
+            "up": (0, -20, 0),  # pitch up
+            "down": (0, 20, 0),  # pitch down
+            "center": (0, 0, 0),  # neutral
         }
 
         if direction not in poses:
@@ -108,6 +111,10 @@ class MovementController:
         pitch = max(-30, min(30, pitch))
         yaw = max(-45, min(45, yaw))
 
+        self.current_roll = roll
+        self.current_pitch = pitch
+        self.current_yaw = yaw
+
         pose = create_head_pose(
             roll=roll,
             pitch=pitch,
@@ -143,6 +150,40 @@ class MovementController:
         await self._goto_target(antennas=[right_rad, left_rad], duration=duration)
         return f"Moved antennas to right={right_angle}, left={left_angle} degrees"
 
+
+    async def track_face_in_image(self, face_x: float, face_y: float, img_w: int, img_h: int) -> None:
+        """Apply proportional control to center a detected face in the camera view."""
+        cx = img_w / 2.0
+        cy = img_h / 2.0
+        
+        # Calculate normalized error (-1.0 to 1.0)
+        err_x = (face_x - cx) / cx
+        err_y = (face_y - cy) / cy
+        
+        # Deadzone: Ignore minor deviations to prevent mechanical jitter
+        if abs(err_x) < 0.15 and abs(err_y) < 0.15:
+            return
+            
+        # Proportional gains (tuning parameters based on camera FOV)
+        p_yaw = 15.0
+        p_pitch = 10.0
+        
+        self.current_yaw -= err_x * p_yaw
+        self.current_pitch += err_y * p_pitch
+        
+        # Clamp bounds to prevent hyper-extension
+        self.current_yaw = max(-45.0, min(45.0, self.current_yaw))
+        self.current_pitch = max(-30.0, min(30.0, self.current_pitch))
+        
+        pose = create_head_pose(
+            roll=self.current_roll,
+            pitch=self.current_pitch,
+            yaw=self.current_yaw,
+            degrees=True,
+        )
+        
+        # Execute rapid adjustment (0.2s) for responsive tracking
+        await self._goto_target(head=pose, duration=0.2)
     async def antenna_expression(self, expression: str) -> str:
         """Set antennas to a preset expression.
 
@@ -154,10 +195,10 @@ class MovementController:
         """
         expressions = {
             "neutral": [0, 0],
-            "alert": [0.8, -0.8],      # Both up/forward
-            "droopy": [-1.0, 1.0],     # Both down
+            "alert": [0.8, -0.8],  # Both up/forward
+            "droopy": [-1.0, 1.0],  # Both down
             "asymmetric": [0.5, 0.2],  # One up, one down
-            "perky": [1.0, -1.0],      # Both fully up
+            "perky": [1.0, -1.0],  # Both fully up
         }
 
         if expression not in expressions:

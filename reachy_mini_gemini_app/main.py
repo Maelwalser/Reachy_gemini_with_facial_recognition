@@ -4,18 +4,6 @@ This app enables real-time voice conversations with Reachy Mini
 using Google's Gemini Live API.
 """
 
-import argparse
-import asyncio
-import logging
-import os
-import threading
-import time
-from typing import Optional
-
-from dotenv import load_dotenv
-
-load_dotenv()
-
 from reachy_mini import ReachyMini, ReachyMiniApp
 
 from reachy_mini_gemini_app.config import get_api_key, load_settings
@@ -25,6 +13,17 @@ from reachy_mini_gemini_app.web_server import (
     start_settings_server,
     stop_settings_server,
 )
+
+import argparse
+import asyncio
+import logging
+import threading
+import time
+from typing import Optional
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -82,8 +81,10 @@ def parse_args() -> argparse.Namespace:
         help="Enable holiday cheer mode with festive personality",
     )
     parser.add_argument(
-        "--knowledge-files", nargs="+", default=[],
-        help="List of PDF or text files to provide as knowledge to the model"
+        "--knowledge-files",
+        nargs="+",
+        default=[],
+        help="List of PDF or text files to provide as knowledge to the model",
     )
 
     # Audio tuning
