@@ -10,6 +10,8 @@ from typing import Optional
 
 import numpy as np
 
+import time
+
 from reachy_mini import ReachyMini
 from reachy_mini.utils import create_head_pose
 import functools
@@ -42,6 +44,12 @@ class MovementController:
         self.current_yaw = 0.0
 
         self.is_animating = False
+
+        self.last_track_time = time.time()
+        self.smoothed_face_x = None
+        self.smoothed_face_y = None
+        self.prev_err_x = 0.0
+        self.prev_err_y = 0.0
 
     async def _goto_target(
         self,
@@ -163,43 +171,86 @@ class MovementController:
         await self._goto_target(antennas=[right_rad, left_rad], duration=duration)
         return f"Moved antennas to right={right_angle}, left={left_angle} degrees"
 
-    async def track_face_in_image(
-        self, face_x: float, face_y: float, img_w: int, img_h: int
-    ) -> None:
-        """Apply proportional control to center a detected face in the camera view."""
-        if self.is_animating:
+    async def track_face_in_image(self, face_x: float, face_y: float, img_w: int, img_h: int) -> None:
+        """Apply filtered PD control to track a detected face smoothly."""
+        if getattr(self, 'is_animating', False):
             return
+
+        current_time = time.time()
+        dt = current_time - self.last_track_time
+        self.last_track_time = current_time
+
+        # Reset kinematic history if the tracking lock was lost for an extended period
+        if dt > 4.0 or dt <= 0.0:
+            dt = 1.0 
+            self.smoothed_face_x = face_x
+            self.smoothed_face_y = face_y
+            self.prev_err_x = 0.0
+            self.prev_err_y = 0.0
+
+        # 1. Spatial Low-Pass Filter (Exponential Moving Average)
+        # alpha controls smoothing: lower = smoother but more lag; higher = responsive but jittery
+        alpha = 1.0
+
+        prev_x = self.smoothed_face_x
+        prev_y = self.smoothed_face_y
+        
+        if prev_x is None or prev_y is None:
+            self.smoothed_face_x = face_x
+            self.smoothed_face_y = face_y
+        else:
+            # Pyright now mathematically guarantees prev_x and prev_y are floats here
+            self.smoothed_face_x = alpha * face_x + (1.0 - alpha) * prev_x
+            self.smoothed_face_y = alpha * face_y + (1.0 - alpha) * prev_y
+
         cx = img_w / 2.0
         cy = img_h / 2.0
-
-        # Calculate normalized error (-1.0 to 1.0)
-        err_x = (face_x - cx) / cx
-        err_y = (face_y - cy) / cy
-
-        # Deadzone: Ignore minor deviations to prevent mechanical jitter
-        if abs(err_x) < 0.15 and abs(err_y) < 0.15:
+        
+        # Calculate normalized spatial error using smoothed coordinates
+        err_x = (self.smoothed_face_x - cx) / cx
+        err_y = (self.smoothed_face_y - cy) / cy
+        
+        # Deadzone: Ignore imperceptible deviations
+        if abs(err_x) < 0.08 and abs(err_y) < 0.08:
+            self.prev_err_x = err_x
+            self.prev_err_y = err_y
             return
-
-        # Proportional gains (tuning parameters based on camera FOV)
-        p_yaw = 15.0
-        p_pitch = 10.0
-
-        self.current_yaw -= err_x * p_yaw
-        self.current_pitch += err_y * p_pitch
-
-        # Clamp bounds to prevent hyper-extension
+            
+        # 2. PD Controller Dynamics
+        p_yaw = 22.0
+        p_pitch = 14.0
+        d_yaw = 4.0
+        d_pitch = 2.5
+        
+        # Calculate error derivatives
+        deriv_x = (err_x - self.prev_err_x) / dt
+        deriv_y = (err_y - self.prev_err_y) / dt
+        
+        # Save state for the next cycle
+        self.prev_err_x = err_x
+        self.prev_err_y = err_y
+        
+        # Apply control effort
+        self.current_yaw -= (err_x * p_yaw + deriv_x * d_yaw)
+        self.current_pitch += (err_y * p_pitch + deriv_y * d_pitch)
+        
+        # Mechanical constraints
         self.current_yaw = max(-45.0, min(45.0, self.current_yaw))
         self.current_pitch = max(-30.0, min(30.0, self.current_pitch))
-
+        
         pose = create_head_pose(
             roll=self.current_roll,
             pitch=self.current_pitch,
             yaw=self.current_yaw,
             degrees=True,
         )
-
-        # Execute rapid adjustment (0.2s) for responsive tracking
-        await self._goto_target(head=pose, duration=0.2)
+        
+        # 3. Temporal Synchronization
+        # We stretch the target duration to span 85% of the time elapsed since the last frame.
+        # This transforms jerky point-to-point commands into a continuous sweeping motion.
+        execution_duration = max(0.2, dt * 0.85)
+        
+        await self._goto_target(head=pose, duration=execution_duration)
 
     async def antenna_expression(self, expression: str) -> str:
         """Set antennas to a preset expression.
