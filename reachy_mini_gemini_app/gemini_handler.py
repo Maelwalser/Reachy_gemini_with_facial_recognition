@@ -15,6 +15,11 @@ import asyncio
 import glob
 import logging
 import os
+import math
+import PyPDF2
+import numpy as np
+from google.genai.types import EmbedContentConfig
+
 import threading
 import time
 import traceback
@@ -141,6 +146,7 @@ class GeminiLiveHandler:
         self.uploaded_files: list[Any] = []
         self.uploaded_knowledge_files: list[Any] = []
         self.document_cache: Any = None  # Stores the pre-computed active memory cache
+        self.page_index: list[dict[str, Any]] = []
 
         # Configurable audio settings
         self.mic_gain = mic_gain
@@ -499,64 +505,59 @@ class GeminiLiveHandler:
                 logger.error(f"Failed to process reference image {image_path}: {e}")
 
     def _upload_knowledge_files(self) -> None:
-        """Upload documents and store references for asynchronous tool retrieval."""
-        self.uploaded_knowledge_files = []
+        """Extract text per page and build a dense vector index for semantic retrieval."""
         if not self.knowledge_files:
             return
 
-        logger.info(f"Processing {len(self.knowledge_files)} knowledge files...")
+        logger.info(
+            f"Building semantic page index for {len(self.knowledge_files)} files..."
+        )
 
         for file_path in self.knowledge_files:
-            if not os.path.exists(file_path):
-                logger.warning(f"Knowledge file not found: {file_path}")
+            if not os.path.exists(file_path) or not file_path.lower().endswith(".pdf"):
+                logger.warning(f"Skipping invalid or non-PDF file: {file_path}")
                 continue
 
-            logger.info(f"Uploading {file_path} to Gemini File API...")
-            uploaded_file = self.client.files.upload(file=file_path)
-
-            # Assertions to satisfy Pyright's Optional type checking
-            assert uploaded_file is not None
-            assert uploaded_file.name is not None
-            assert uploaded_file.state is not None
-
-            while uploaded_file.state.name == "PROCESSING":
-                time.sleep(2)
-                uploaded_file = self.client.files.get(name=uploaded_file.name)
-                # Re-assert after fetching the updated state
-                assert uploaded_file is not None
-                assert uploaded_file.name is not None
-                assert uploaded_file.state is not None
-
-            if uploaded_file.state.name == "FAILED":
-                logger.error(f"File processing failed: {file_path}")
-                continue
-
-            # Store the File object. It resides on Google's servers, costing zero local memory.
-            self.uploaded_knowledge_files.append(uploaded_file)
-            logger.info(f"Successfully mapped {file_path} for retrieval.")
-        # NEW LOGIC: Pre-compute the cache for low-latency retrieval
-        if self.uploaded_knowledge_files:
-            logger.info("Constructing active Context Cache for the manuals...")
             try:
-                self.document_cache = self.client.caches.create(
-                    model="gemini-2.5-flash",
-                    config=types.CreateCachedContentConfig(
-                        contents=self.uploaded_knowledge_files,
-                        system_instruction=(
-                            "You are a rigorous technical data extractor. You must extract highly detailed, "
-                            "step-by-step instructions directly from the provided manual. You must include all "
-                            "specific technical metrics, part numbers, screw types (e.g., 'M3x16 8.8'), and "
-                            "torque specifications (e.g., 'Anzugsdrehmoment: 0,9 Nm') verbatim. Never summarize "
-                            "a procedure by merely stating it can be found in the text."
-                        ),
-                        ttl="3600s",
-                    ),
-                )
+                with open(file_path, "rb") as file:
+                    reader = PyPDF2.PdfReader(file)
+
+                    # Process in batches to avoid API rate limits
+                    for page_num in range(len(reader.pages)):
+                        page = reader.pages[page_num]
+                        text = page.extract_text()
+
+                        if not text.strip():
+                            continue
+
+                        # Generate semantic embedding for the page
+                        response = self.client.models.embed_content(
+                            model="gemini-embedding-001",
+                            contents=text,
+                            config=EmbedContentConfig(task_type="RETRIEVAL_DOCUMENT"),
+                        )
+
+                        if not response.embeddings or not response.embeddings[0].values:
+                            logger.warning(
+                                f"Failed to generate valid embedding vector for page {page_num + 1} of {file_path}"
+                            )
+                            continue
+
+                        # Store the mapping
+                        self.page_index.append(
+                            {
+                                "file_name": os.path.basename(file_path),
+                                "page_number": page_num + 1,
+                                "content": text,
+                                "embedding": np.array(response.embeddings[0].values),
+                            }
+                        )
+
                 logger.info(
-                    f"Context Cache created successfully: {self.document_cache.name}"
+                    f"Successfully indexed {len(reader.pages)} pages from {file_path}"
                 )
             except Exception as e:
-                logger.error(f"Failed to create Context Cache: {e}")
+                logger.error(f"Failed to process {file_path}: {e}")
 
     async def _handle_tool_call(self, tool_call: Any) -> str:
         """Handle a function call from the model."""
@@ -694,41 +695,59 @@ class GeminiLiveHandler:
             await out_q.put({"data": data, "mime_type": "audio/pcm"})
 
     async def _execute_document_query(self, query: str) -> str:
-        """Executes a low-latency generation call against the pre-computed Cache."""
-        if not self.uploaded_knowledge_files:
-            return "Error: No reference manuals are currently loaded into the system."
+        """Executes a semantic search against the page index and returns targeted context."""
+        if not self.page_index:
+            return "Error: No indexed reference manuals are currently available."
 
-        logger.info(f"Executing deep cache-accelerated search for: {query}")
+        logger.info(f"Executing semantic page search for: {query}")
 
-        def _run_query():
-            # Der erzwingende Prompt für die Datenextraktion
-            extraction_prompt = (
-                f"Provide the exact, step-by-step technical instructions for the following query. "
-                f"You must include all measurements, torque values, and hardware specifications verbatim "
-                f"as they appear in the German source text. Query: {query}"
+        def _run_search():
+            # 1. Embed the search query
+            query_response = self.client.models.embed_content(
+                model="gemini-embedding-001",
+                contents=query,
+                config=EmbedContentConfig(task_type="RETRIEVAL_QUERY"),
             )
+            if not query_response.embeddings or not query_response.embeddings[0].values:
+                return "Error: The system failed to generate a semantic vector for your query."
 
-            if getattr(self, "document_cache", None):
-                response = self.client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=extraction_prompt,
-                    config=types.GenerateContentConfig(
-                        cached_content=self.document_cache.name
-                    )
+            query_vector = np.array(query_response.embeddings[0].values)
+
+            # 2. Calculate Cosine Similarity across all pages
+            scores = []
+            for page in self.page_index:
+                page_vector = page["embedding"]
+                # Cosine similarity formula: (A dot B) / (||A|| * ||B||)
+                similarity = np.dot(query_vector, page_vector) / (
+                    np.linalg.norm(query_vector) * np.linalg.norm(page_vector)
                 )
-            else:
-                response = self.client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[
-                        self.uploaded_knowledge_files[0],
-                        extraction_prompt,
-                    ],
-                )
-            return response.text
+                scores.append((similarity, page))
+
+            # 3. Sort and extract the top 3 most relevant pages
+            scores.sort(key=lambda x: x[0], reverse=True)
+            top_results = scores[:3]
+
+            # 4. Format the output for the Live API model to consume
+            formatted_context = (
+                f"Here are the most relevant pages found for the query '{query}':\n\n"
+            )
+            for score, page in top_results:
+                # Only include pages with a meaningful semantic match
+                if score > 0.4:
+                    formatted_context += f"--- Source: {page['file_name']}, Page: {page['page_number']} ---\n"
+                    formatted_context += f"{page['content']}\n\n"
+
+            if (
+                formatted_context
+                == f"Here are the most relevant pages found for the query '{query}':\n\n"
+            ):
+                return "I searched the manual, but could not find any pages highly relevant to that specific query."
+
+            return formatted_context
 
         try:
-            result = await asyncio.to_thread(_run_query)
-            return result if result else "No relevant information found in the manual."
+            result = await asyncio.to_thread(_run_search)
+            return result
         except Exception as e:
             logger.error(f"Document query failed: {e}")
             return f"System error during document retrieval: {e}"
