@@ -7,6 +7,7 @@ can use as tools during conversation.
 import asyncio
 import logging
 from typing import Optional
+import math
 
 import numpy as np
 
@@ -357,6 +358,61 @@ class MovementController:
         await self._goto_target(head=pose, duration=0.4)
         return f"Tilted head {direction}"
 
+    async def imitate_face(self, landmarks: dict) -> None:
+        """Estimate head pose from 2D landmarks and mirror the user."""
+        if getattr(self, 'is_animating', False):
+            return
+
+        # Extract key facial features
+        left_eye = np.mean(landmarks['left_eye'], axis=0)
+        right_eye = np.mean(landmarks['right_eye'], axis=0)
+        nose_tip = landmarks['nose_tip'][0]
+
+        # Calculate deltas between eyes
+        dx = right_eye[0] - left_eye[0]
+        dy = right_eye[1] - left_eye[1]
+        eye_dist = math.hypot(dx, dy)
+        if eye_dist < 1.0:
+            eye_dist = 1.0
+
+        # 1. Roll (Tilt): Angle between the eyes
+        # Positive roll tilts the robot's head right, perfectly mirroring the user.
+        roll = math.degrees(math.atan2(dy, dx))
+
+        # 2. Yaw (Turn): Horizontal position of the nose relative to the eyes
+        eye_center_x = (left_eye[0] + right_eye[0]) / 2.0
+        nose_offset_x = nose_tip[0] - eye_center_x
+        yaw_ratio = nose_offset_x / eye_dist
+        # Scale ratio to degrees. Negative yaw turns robot left, mirroring a user turning right.
+        yaw = yaw_ratio * 50.0 
+
+        # 3. Pitch (Up/Down): Vertical position of the nose relative to the eyes
+        eye_center_y = (left_eye[1] + right_eye[1]) / 2.0
+        nose_offset_y = nose_tip[1] - eye_center_y
+        pitch_ratio = nose_offset_y / eye_dist
+        # 0.6 is the approximate neutral ratio. Positive pitch looks down.
+        pitch = (pitch_ratio - 0.6) * 50.0 
+
+        # Temporal Smoothing (Exponential Moving Average) to prevent jitter
+        alpha = 0.4
+        self.current_roll = alpha * roll + (1.0 - alpha) * self.current_roll
+        self.current_yaw = alpha * yaw + (1.0 - alpha) * self.current_yaw
+        self.current_pitch = alpha * pitch + (1.0 - alpha) * self.current_pitch
+
+        # Mechanical constraints
+        self.current_roll = max(-30.0, min(30.0, self.current_roll))
+        self.current_yaw = max(-45.0, min(45.0, self.current_yaw))
+        self.current_pitch = max(-30.0, min(30.0, self.current_pitch))
+
+        pose = create_head_pose(
+            roll=self.current_roll,
+            pitch=self.current_pitch,
+            yaw=self.current_yaw,
+            degrees=True,
+        )
+        
+        # Fast execution duration for real-time responsiveness
+        await self._goto_target(head=pose, duration=0.2)
     async def look_at_camera(self) -> str:
         """Look directly at the camera (center position)."""
         pose = create_head_pose(degrees=True)
@@ -588,7 +644,20 @@ class MovementController:
         return f"Finished {style} dance"
 
     async def reset_position(self) -> str:
-        """Reset head and antennas to neutral position."""
+        """Reset head and antennas to neutral position and clear kinematic state."""
+        # 1. Zero the absolute angular state
+        self.current_roll = 0.0
+        self.current_pitch = 0.0
+        self.current_yaw = 0.0
+        
+        # 2. Flush the PD tracking history to prevent derivative spikes
+        self.smoothed_face_x = None
+        self.smoothed_face_y = None
+        self.prev_err_x = 0.0
+        self.prev_err_y = 0.0
+
+        # 3. Dispatch the physical motor command
         pose = create_head_pose(degrees=True)
         await self._goto_target(head=pose, antennas=[0, 0], duration=0.5)
+        
         return "Reset to neutral position"

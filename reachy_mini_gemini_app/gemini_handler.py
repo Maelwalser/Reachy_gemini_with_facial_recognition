@@ -78,6 +78,8 @@ Available movement tools - integrate these naturally to enhance communication:
 - wake_up: Wake up animation for system initialization.
 - go_to_sleep: Sleep animation for standby mode.
 - reset_position: Return to neutral, professional posture.
+- start_imitation: Activate mirror mode to imitate the user's head movements. Use this when asked to "imitate me", "mirror me", or "copy my movements".
+- stop_imitation: Deactivate mirror mode and return to normal tracking.
 
 Face Learning Protocol:
 If a user asks you to learn their face or says "recognize me", you must FIRST state that you need to take a picture. Ask them to position themselves squarely in front of your camera and ask for their name. ONLY AFTER they state their name and confirm they are ready, execute the `learn_face` tool to capture their identity.
@@ -161,6 +163,8 @@ class GeminiLiveHandler:
         self._load_known_faces()
         self.camera_lock = asyncio.Lock()
 
+        self.is_imitating = False
+
         # Log configuration
         logger.info(f"Audio config: mic_gain={mic_gain}, chunk_size={chunk_size}")
         logger.info(f"Queue config: send={send_queue_size}, recv={recv_queue_size}")
@@ -213,6 +217,17 @@ class GeminiLiveHandler:
             ),
         )
 
+        start_imitation_tool = types.FunctionDeclaration(
+            name="start_imitation",
+            description="Start imitating or mirroring the user's head movements using the camera.",
+            parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+        )
+
+        stop_imitation_tool = types.FunctionDeclaration(
+            name="stop_imitation",
+            description="Stop imitating the user's head movements.",
+            parameters=types.Schema(type=types.Type.OBJECT, properties={}),
+        )
         learn_face_tool = types.FunctionDeclaration(
             name="learn_face",
             description="Take a photo using the robot's camera to learn and remember a new person's face. Call this ONLY after the person has positioned themselves in front of the camera and told you their name.",
@@ -466,6 +481,8 @@ class GeminiLiveHandler:
             learn_face_tool,
             get_current_weather_tool,
             query_manual_tool,
+            start_imitation_tool,
+            stop_imitation_tool,
         ]
 
         return [types.Tool(function_declarations=all_tools)]
@@ -643,7 +660,15 @@ class GeminiLiveHandler:
                 if not query:
                     return "Error: No search query provided."
                 return await self._execute_document_query(query)
+            # ---> ADD THE NEW ROUTING HERE <---
+            elif name == "start_imitation":
+                self.is_imitating = True
+                return "Successfully started imitating the user's movements."
 
+            elif name == "stop_imitation":
+                self.is_imitating = False
+                await self.movement_controller.reset_position()
+                return "Successfully stopped imitating the user."
             else:
                 logger.warning(f"Unknown tool: {name}")
                 return f"Unknown tool: {name}"
@@ -1136,55 +1161,65 @@ class GeminiLiveHandler:
                         largest_face = max(
                             face_locations, key=lambda f: (f[2] - f[0]) * (f[1] - f[3])
                         )
-                        top, right, bottom, left = largest_face
-
-                        # Compute geometric center
-                        face_cx = (left + right) / 2
-                        face_cy = (top + bottom) / 2
-                        img_h, img_w = rgb_small_frame.shape[:2]
-
-                        # Dispatch tracking command asynchronously to avoid blocking the camera thread
-                        asyncio.create_task(
-                            self.movement_controller.track_face_in_image(
-                                face_cx, face_cy, img_w, img_h
+                        if self.is_imitating:
+                            # Extract 2D facial landmarks for pose estimation
+                            landmarks_list = await asyncio.to_thread(
+                                face_recognition.face_landmarks, rgb_small_frame, [largest_face]
                             )
-                        )
-
-                        # 2. BIOMETRIC IDENTIFICATION
-                        if self.known_face_encodings:
-                            face_encodings = await asyncio.to_thread(
-                                face_recognition.face_encodings,
-                                rgb_small_frame,
-                                face_locations,
-                            )
-
-                            for face_encoding in face_encodings:
-                                matches = face_recognition.compare_faces(
-                                    self.known_face_encodings,
-                                    face_encoding,
-                                    tolerance=0.6,
+                            if landmarks_list:
+                                asyncio.create_task(
+                                    self.movement_controller.imitate_face(landmarks_list[0])
                                 )
-                                if True in matches:
-                                    first_match_index = matches.index(True)
-                                    name = self.known_face_names[first_match_index]
+                        else:
+                            top, right, bottom, left = largest_face
 
-                                    last_seen = self.greeting_cooldowns.get(name, 0.0)
-                                    if (
-                                        current_time - last_seen
-                                        > self.greeting_timeout_seconds
-                                    ):
-                                        logger.info(
-                                            f"Positive identification: {name}. Cooldown expired. Injecting context."
-                                        )
-                                        # Update the specific individual's timestamp
-                                        self.greeting_cooldowns[name] = current_time
+                            # Compute geometric center
+                            face_cx = (left + right) / 2
+                            face_cy = (top + bottom) / 2
+                            img_h, img_w = rgb_small_frame.shape[:2]
 
-                                        alert_msg = f"[SYSTEM DIRECTIVE: {name} is now standing in front of you. You MUST execute a verbal greeting immediately, and you MUST explicitly speak the name '{name}' in your greeting.]"
+                            # Dispatch tracking command asynchronously to avoid blocking the camera thread
+                            asyncio.create_task(
+                                self.movement_controller.track_face_in_image(
+                                    face_cx, face_cy, img_w, img_h
+                                )
+                            )
 
-                                        try:
-                                            out_q.put_nowait(alert_msg)
-                                        except asyncio.QueueFull:
-                                            pass
+                            # 2. BIOMETRIC IDENTIFICATION
+                            if self.known_face_encodings:
+                                face_encodings = await asyncio.to_thread(
+                                    face_recognition.face_encodings,
+                                    rgb_small_frame,
+                                    face_locations,
+                                )
+
+                                for face_encoding in face_encodings:
+                                    matches = face_recognition.compare_faces(
+                                        self.known_face_encodings,
+                                        face_encoding,
+                                        tolerance=0.6,
+                                    )
+                                    if True in matches:
+                                        first_match_index = matches.index(True)
+                                        name = self.known_face_names[first_match_index]
+
+                                        last_seen = self.greeting_cooldowns.get(name, 0.0)
+                                        if (
+                                            current_time - last_seen
+                                            > self.greeting_timeout_seconds
+                                        ):
+                                            logger.info(
+                                                f"Positive identification: {name}. Cooldown expired. Injecting context."
+                                            )
+                                            # Update the specific individual's timestamp
+                                            self.greeting_cooldowns[name] = current_time
+
+                                            alert_msg = f"[SYSTEM DIRECTIVE: {name} is now standing in front of you. You MUST execute a verbal greeting immediately, and you MUST explicitly speak the name '{name}' in your greeting.]"
+
+                                            try:
+                                                out_q.put_nowait(alert_msg)
+                                            except asyncio.QueueFull:
+                                                pass
 
                 h, w = frame.shape[:2]
                 if w > self.camera_width:
