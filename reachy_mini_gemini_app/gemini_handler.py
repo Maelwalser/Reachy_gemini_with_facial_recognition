@@ -230,13 +230,18 @@ class GeminiLiveHandler:
 
         query_manual_tool = types.FunctionDeclaration(
             name="query_technical_manual",
-            description="Query the uploaded 400-page reference manual for specific information. Use this whenever the user asks a question requiring deep, specific knowledge from the provided documentation.",
+            description=(
+                "Query the uploaded reference manual for specific technical procedures. "
+                "CRITICAL DIRECTIVE: When you receive the result from this tool, you MUST verbally relay "
+                "the exact step-by-step instructions, including all technical specifications, screw types (e.g., M3x16), "
+                "and torque values (e.g., 0.9 Nm) to the user. Never summarize by simply stating that the information exists."
+            ),
             parameters=types.Schema(
                 type=types.Type.OBJECT,
                 properties={
                     "search_query": types.Schema(
                         type=types.Type.STRING,
-                        description="A highly specific question or search term to look up in the manual.",
+                        description="A highly specific question to look up in the manual.",
                     ),
                 },
                 required=["search_query"],
@@ -537,17 +542,21 @@ class GeminiLiveHandler:
                     model="gemini-2.5-flash",
                     config=types.CreateCachedContentConfig(
                         contents=self.uploaded_knowledge_files,
-                        system_instruction="You are an expert technical data extractor. You must extract concise, accurate answers strictly based on the provided reference documents.",
-                        ttl="3600s",  # Cache lives in active memory for 1 hour
+                        system_instruction=(
+                            "You are a rigorous technical data extractor. You must extract highly detailed, "
+                            "step-by-step instructions directly from the provided manual. You must include all "
+                            "specific technical metrics, part numbers, screw types (e.g., 'M3x16 8.8'), and "
+                            "torque specifications (e.g., 'Anzugsdrehmoment: 0,9 Nm') verbatim. Never summarize "
+                            "a procedure by merely stating it can be found in the text."
+                        ),
+                        ttl="3600s",
                     ),
                 )
                 logger.info(
                     f"Context Cache created successfully: {self.document_cache.name}"
                 )
             except Exception as e:
-                logger.error(
-                    f"Failed to create Context Cache. Falling back to cold-queries: {e}"
-                )
+                logger.error(f"Failed to create Context Cache: {e}")
 
     async def _handle_tool_call(self, tool_call: Any) -> str:
         """Handle a function call from the model."""
@@ -692,22 +701,27 @@ class GeminiLiveHandler:
         logger.info(f"Executing deep cache-accelerated search for: {query}")
 
         def _run_query():
-            # If the cache was successfully built, use it.
-            if self.document_cache:
+            # Der erzwingende Prompt für die Datenextraktion
+            extraction_prompt = (
+                f"Provide the exact, step-by-step technical instructions for the following query. "
+                f"You must include all measurements, torque values, and hardware specifications verbatim "
+                f"as they appear in the German source text. Query: {query}"
+            )
+
+            if getattr(self, "document_cache", None):
                 response = self.client.models.generate_content(
                     model="gemini-2.5-flash",
-                    contents=f"Query: {query}",
+                    contents=extraction_prompt,
                     config=types.GenerateContentConfig(
                         cached_content=self.document_cache.name
                     )
                 )
-            # Fallback if cache creation failed
             else:
                 response = self.client.models.generate_content(
                     model="gemini-2.5-flash",
                     contents=[
                         self.uploaded_knowledge_files[0],
-                        f"Extract a concise, accurate answer to the following query based strictly on the provided document. Query: {query}",
+                        extraction_prompt,
                     ],
                 )
             return response.text
@@ -1233,7 +1247,7 @@ class GeminiLiveHandler:
         if self.pya:
             self.pya.terminate()
             self.pya = None
-            
+
         # Destroy the active memory cache to halt billing
         if getattr(self, "document_cache", None):
             try:
