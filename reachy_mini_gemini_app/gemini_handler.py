@@ -714,7 +714,7 @@ class GeminiLiveHandler:
                     contents=extraction_prompt,
                     config=types.GenerateContentConfig(
                         cached_content=self.document_cache.name
-                    )
+                    ),
                 )
             else:
                 response = self.client.models.generate_content(
@@ -840,6 +840,51 @@ class GeminiLiveHandler:
             return "Error: Camera is disabled or unavailable. I cannot take a photo."
 
         try:
+            # --- 1. TARGET ACQUISITION PHASE ---
+            # Reset to a neutral center position to acquire a baseline view
+            await self.movement_controller.look_at_camera()
+            await asyncio.sleep(0.5)
+
+            logger.info(
+                "Executing visual servoing loop to center face before capture..."
+            )
+            # Run a rapid tracking loop to align the camera exactly with the user
+            for _ in range(5):
+                async with self.camera_lock:
+                    temp_frame = await asyncio.to_thread(self.robot.media.get_frame)
+
+                if temp_frame is not None:
+                    # Downscale for lower latency in the control loop
+                    small_frame = cv2.resize(temp_frame, (0, 0), fx=0.25, fy=0.25)
+                    rgb_small_frame = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+
+                    face_locations = await asyncio.to_thread(
+                        face_recognition.face_locations, rgb_small_frame
+                    )
+
+                    if face_locations:
+                        # Isolate the largest bounding box (assumed primary subject)
+                        largest_face = max(
+                            face_locations, key=lambda f: (f[2] - f[0]) * (f[1] - f[3])
+                        )
+                        top, right, bottom, left = largest_face
+
+                        # Compute geometric center
+                        face_cx = (left + right) / 2
+                        face_cy = (top + bottom) / 2
+                        img_h, img_w = rgb_small_frame.shape[:2]
+
+                        # Dispatch proportional tracking command
+                        await self.movement_controller.track_face_in_image(
+                            face_cx, face_cy, img_w, img_h
+                        )
+                        # Wait for servo movement to execute before evaluating next frame
+                        await asyncio.sleep(0.3)
+                    else:
+                        await asyncio.sleep(0.1)
+
+            # --- 2. BIOMETRIC CAPTURE PHASE ---
+            # Take the final aligned photo
             async with self.camera_lock:
                 frame = await asyncio.to_thread(self.robot.media.get_frame)
 
@@ -1075,7 +1120,7 @@ class GeminiLiveHandler:
                 self.last_frame_time = current_time
 
                 frame_count += 1
-                
+
                 # Execute face detection at interval, regardless of known biometrics
                 if frame_count % FACE_CHECK_INTERVAL == 0:
                     small_frame = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
@@ -1084,32 +1129,40 @@ class GeminiLiveHandler:
                     face_locations = await asyncio.to_thread(
                         face_recognition.face_locations, rgb_small_frame
                     )
-                    
+
                     if face_locations:
                         # 1. VISUAL SERVOING
                         # Isolate the largest bounding box (assumed closest subject)
-                        largest_face = max(face_locations, key=lambda f: (f[2]-f[0]) * (f[1]-f[3]))
+                        largest_face = max(
+                            face_locations, key=lambda f: (f[2] - f[0]) * (f[1] - f[3])
+                        )
                         top, right, bottom, left = largest_face
-                        
+
                         # Compute geometric center
                         face_cx = (left + right) / 2
                         face_cy = (top + bottom) / 2
                         img_h, img_w = rgb_small_frame.shape[:2]
-                        
+
                         # Dispatch tracking command asynchronously to avoid blocking the camera thread
                         asyncio.create_task(
-                            self.movement_controller.track_face_in_image(face_cx, face_cy, img_w, img_h)
+                            self.movement_controller.track_face_in_image(
+                                face_cx, face_cy, img_w, img_h
+                            )
                         )
 
                         # 2. BIOMETRIC IDENTIFICATION
                         if self.known_face_encodings:
                             face_encodings = await asyncio.to_thread(
-                                face_recognition.face_encodings, rgb_small_frame, face_locations
+                                face_recognition.face_encodings,
+                                rgb_small_frame,
+                                face_locations,
                             )
 
                             for face_encoding in face_encodings:
                                 matches = face_recognition.compare_faces(
-                                    self.known_face_encodings, face_encoding, tolerance=0.6
+                                    self.known_face_encodings,
+                                    face_encoding,
+                                    tolerance=0.6,
                                 )
                                 if True in matches:
                                     first_match_index = matches.index(True)
