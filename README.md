@@ -41,8 +41,15 @@ brew install portaudio
 # Install PortAudio (Ubuntu)
 sudo apt-get install portaudio19-dev python3-dev
 
+pip install face_recognition opencv-python numpy
+
 # Install the app (basic - local audio only)
 pip install -e .
+
+pip install "setuptools<82"
+
+# Add images of faces to recognize
+mkdir known_faces
 
 # Install with wireless/GStreamer support (for robot audio/camera over network)
 pip install -e ".[wireless]"
