@@ -164,7 +164,7 @@ class GeminiLiveHandler:
         self.camera_lock = asyncio.Lock()
 
         self.is_imitating = False
-        self.is_speaking = False
+        self.speak_until = 0.0
 
         # Log configuration
         logger.info(f"Audio config: mic_gain={mic_gain}, chunk_size={chunk_size}")
@@ -661,7 +661,7 @@ class GeminiLiveHandler:
                 if not query:
                     return "Error: No search query provided."
                 return await self._execute_document_query(query)
-            # ---> ADD THE NEW ROUTING HERE <---
+            
             elif name == "start_imitation":
                 self.is_imitating = True
                 self._saved_camera_fps = self.camera_fps
@@ -725,7 +725,8 @@ class GeminiLiveHandler:
             data = await asyncio.to_thread(
                 self.audio_stream.read, self.chunk_size, **kwargs
             )
-            if getattr(self, "is_speaking", False):
+            # Drop frame if we are inside the mathematical playback window + 0.4s room echo delay
+            if time.time() < getattr(self, "speak_until", 0.0) + 0.4:
                 continue
             await out_q.put({"data": data, "mime_type": "audio/pcm"})
 
@@ -838,7 +839,7 @@ class GeminiLiveHandler:
                     await asyncio.sleep(0.005)
                     continue
 
-                if getattr(self, "is_speaking", False):
+                if time.time() < getattr(self, "speak_until", 0.0) + 0.4:
                     continue
                 if isinstance(sample, np.ndarray):
                     if sample.dtype == np.float32:
@@ -1053,7 +1054,6 @@ class GeminiLiveHandler:
                 logger.error("PyAudio not available and robot audio not working")
                 while True:
                     await in_q.get()
-                return
             self.pya = pyaudio.PyAudio()
 
         assert self.pya is not None
@@ -1066,12 +1066,15 @@ class GeminiLiveHandler:
         )
         while True:
             bytestream = await in_q.get()
-            await asyncio.to_thread(stream.write, bytestream)
+            # 16-bit audio = 2 bytes per sample. Calculate exact duration in seconds.
+            chunk_duration = (len(bytestream) / 2) / RECEIVE_SAMPLE_RATE
 
-            if in_q.empty():
-                await asyncio.sleep(0.4)  # Wait for room echo to decay
-                if in_q.empty():
-                    self.is_speaking = False
+            # Push the mute window into the future
+            current_time = time.time()
+            self.speak_until = (
+                max(current_time, getattr(self, "speak_until", 0.0)) + chunk_duration
+            )
+            await asyncio.to_thread(stream.write, bytestream)
 
     async def _play_audio_robot(self) -> None:
         """Play audio through Reachy Mini's speaker."""
@@ -1093,7 +1096,15 @@ class GeminiLiveHandler:
         while True:
             try:
                 bytestream = await in_q.get()
-                self.is_speaking = True
+                
+                # 16-bit audio = 2 bytes per sample. Calculate exact duration in seconds.
+                chunk_duration = (len(bytestream) / 2) / RECEIVE_SAMPLE_RATE
+                
+                # Push the mute window into the future
+                current_time = time.time()
+                self.speak_until = (
+                    max(current_time, getattr(self, "speak_until", 0.0)) + chunk_duration
+                )
 
                 audio_int16 = np.frombuffer(bytestream, dtype=np.int16)
                 audio_float32 = audio_int16.astype(np.float32) / 32767.0
@@ -1109,10 +1120,6 @@ class GeminiLiveHandler:
                     self.robot.media.push_audio_sample,
                     audio_resampled.astype(np.float32),
                 )
-                if in_q.empty():
-                    await asyncio.sleep(0.4)
-                    if in_q.empty():
-                        self.is_speaking = False
 
             except Exception as e:
                 logger.debug(f"Audio playback error: {e}")
