@@ -164,6 +164,7 @@ class GeminiLiveHandler:
         self.camera_lock = asyncio.Lock()
 
         self.is_imitating = False
+        self.is_speaking = False
 
         # Log configuration
         logger.info(f"Audio config: mic_gain={mic_gain}, chunk_size={chunk_size}")
@@ -665,7 +666,7 @@ class GeminiLiveHandler:
                 self.is_imitating = True
                 self._saved_camera_fps = self.camera_fps
                 self.camera_fps = max(self.camera_fps, 5.0)
-                 # Reset tracking state for clean start
+                # Reset tracking state for clean start
                 self.movement_controller.current_roll = 0.0
                 self.movement_controller.current_pitch = 0.0
                 self.movement_controller.current_yaw = 0.0
@@ -673,8 +674,8 @@ class GeminiLiveHandler:
 
             elif name == "stop_imitation":
                 self.is_imitating = False
-                if hasattr(self, '_saved_camera_fps'):
-                     self.camera_fps = self._saved_camera_fps
+                if hasattr(self, "_saved_camera_fps"):
+                    self.camera_fps = self._saved_camera_fps
                 await self.movement_controller.reset_position()
                 return "Successfully stopped imitating the user."
             else:
@@ -724,6 +725,8 @@ class GeminiLiveHandler:
             data = await asyncio.to_thread(
                 self.audio_stream.read, self.chunk_size, **kwargs
             )
+            if getattr(self, "is_speaking", False):
+                continue
             await out_q.put({"data": data, "mime_type": "audio/pcm"})
 
     async def _execute_document_query(self, query: str) -> str:
@@ -835,6 +838,8 @@ class GeminiLiveHandler:
                     await asyncio.sleep(0.005)
                     continue
 
+                if getattr(self, "is_speaking", False):
+                    continue
                 if isinstance(sample, np.ndarray):
                     if sample.dtype == np.float32:
                         if len(sample.shape) == 2 and sample.shape[1] == 2:
@@ -1063,6 +1068,11 @@ class GeminiLiveHandler:
             bytestream = await in_q.get()
             await asyncio.to_thread(stream.write, bytestream)
 
+            if in_q.empty():
+                await asyncio.sleep(0.4)  # Wait for room echo to decay
+                if in_q.empty():
+                    self.is_speaking = False
+
     async def _play_audio_robot(self) -> None:
         """Play audio through Reachy Mini's speaker."""
         if not hasattr(self.robot.media, "audio") or self.robot.media.audio is None:
@@ -1083,6 +1093,7 @@ class GeminiLiveHandler:
         while True:
             try:
                 bytestream = await in_q.get()
+                self.is_speaking = True
 
                 audio_int16 = np.frombuffer(bytestream, dtype=np.int16)
                 audio_float32 = audio_int16.astype(np.float32) / 32767.0
@@ -1098,6 +1109,10 @@ class GeminiLiveHandler:
                     self.robot.media.push_audio_sample,
                     audio_resampled.astype(np.float32),
                 )
+                if in_q.empty():
+                    await asyncio.sleep(0.4)
+                    if in_q.empty():
+                        self.is_speaking = False
 
             except Exception as e:
                 logger.debug(f"Audio playback error: {e}")
@@ -1154,9 +1169,8 @@ class GeminiLiveHandler:
 
                 frame_count += 1
                 should_check_face = (
-                     self.is_imitating
-                     or frame_count % FACE_CHECK_INTERVAL == 0
-                 )
+                    self.is_imitating or frame_count % FACE_CHECK_INTERVAL == 0
+                )
                 if should_check_face:
                     # Execute face detection at interval, regardless of known biometrics
                     if frame_count % FACE_CHECK_INTERVAL == 0:
@@ -1171,16 +1185,21 @@ class GeminiLiveHandler:
                             # 1. VISUAL SERVOING
                             # Isolate the largest bounding box (assumed closest subject)
                             largest_face = max(
-                                face_locations, key=lambda f: (f[2] - f[0]) * (f[1] - f[3])
+                                face_locations,
+                                key=lambda f: (f[2] - f[0]) * (f[1] - f[3]),
                             )
                             if self.is_imitating:
                                 # Extract 2D facial landmarks for pose estimation
                                 landmarks_list = await asyncio.to_thread(
-                                    face_recognition.face_landmarks, rgb_small_frame, [largest_face]
+                                    face_recognition.face_landmarks,
+                                    rgb_small_frame,
+                                    [largest_face],
                                 )
                                 if landmarks_list:
                                     asyncio.create_task(
-                                        self.movement_controller.imitate_face(landmarks_list[0])
+                                        self.movement_controller.imitate_face(
+                                            landmarks_list[0]
+                                        )
                                     )
                             else:
                                 top, right, bottom, left = largest_face
@@ -1213,9 +1232,13 @@ class GeminiLiveHandler:
                                         )
                                         if True in matches:
                                             first_match_index = matches.index(True)
-                                            name = self.known_face_names[first_match_index]
+                                            name = self.known_face_names[
+                                                first_match_index
+                                            ]
 
-                                            last_seen = self.greeting_cooldowns.get(name, 0.0)
+                                            last_seen = self.greeting_cooldowns.get(
+                                                name, 0.0
+                                            )
                                             if (
                                                 current_time - last_seen
                                                 > self.greeting_timeout_seconds
@@ -1224,7 +1247,9 @@ class GeminiLiveHandler:
                                                     f"Positive identification: {name}. Cooldown expired. Injecting context."
                                                 )
                                                 # Update the specific individual's timestamp
-                                                self.greeting_cooldowns[name] = current_time
+                                                self.greeting_cooldowns[name] = (
+                                                    current_time
+                                                )
 
                                                 alert_msg = f"[SYSTEM DIRECTIVE: {name} is now standing in front of you. You MUST execute a verbal greeting immediately, and you MUST explicitly speak the name '{name}' in your greeting.]"
 
