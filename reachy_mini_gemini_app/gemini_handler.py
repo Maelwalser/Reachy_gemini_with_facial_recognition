@@ -981,7 +981,6 @@ class GeminiLiveHandler:
 
     async def receive_audio(self) -> None:
         """Receive responses from Gemini and handle them."""
-        # Local Binding
         session = self.session
         in_q = self.audio_in_queue
         assert session is not None
@@ -992,14 +991,7 @@ class GeminiLiveHandler:
                 turn = session.receive()
                 async for response in turn:
                     if data := response.data:
-                        try:
-                            in_q.put_nowait(data)
-                        except asyncio.QueueFull:
-                            try:
-                                in_q.get_nowait()
-                                in_q.put_nowait(data)
-                            except Exception:
-                                pass
+                        await in_q.put(data)
                         continue
 
                     if hasattr(response, "text") and response.text:
@@ -1026,14 +1018,11 @@ class GeminiLiveHandler:
                             except Exception as e:
                                 logger.error(f"Failed to send tool response: {e}")
 
-                if in_q.qsize() > self.recv_queue_size - 2:
-                    while not in_q.empty():
-                        in_q.get_nowait()
+                # ✅ REMOVED: the post-turn queue flush that was cutting off sentences
 
             except Exception as e:
                 logger.warning(f"Receive audio error: {e}")
                 await asyncio.sleep(0.1)
-
     async def play_audio(self) -> None:
         """Play received audio from queue."""
         if self.use_robot_audio:
@@ -1325,7 +1314,7 @@ class GeminiLiveHandler:
                     asyncio.TaskGroup() as tg,
                 ):
                     self.session = session
-                    self.audio_in_queue = asyncio.Queue(maxsize=self.recv_queue_size)
+                    self.audio_in_queue = asyncio.Queue()
                     self.out_queue = asyncio.Queue(maxsize=self.send_queue_size)
 
                     audio_source = "robot" if self.use_robot_audio else "local"
