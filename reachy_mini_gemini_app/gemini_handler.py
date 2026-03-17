@@ -766,6 +766,52 @@ class GeminiLiveHandler:
                 continue
             await out_q.put({"data": data, "mime_type": "audio/pcm"})
 
+    async def _speak_phrase(self, text: str) -> None:
+        """Generate a short TTS phrase via Gemini and push PCM into the playback queue.
+
+        The phrase is enqueued immediately so it plays concurrently while the
+        caller performs longer work (e.g. a RAG lookup).
+        """
+        import io
+        import wave
+
+        def _generate() -> tuple[bytes | None, str | None]:
+            response = self.client.models.generate_content(
+                model="gemini-2.5-flash-preview-tts",
+                contents=text,
+                config=types.GenerateContentConfig(
+                    response_modalities=["AUDIO"],
+                    speech_config=types.SpeechConfig(
+                        voice_config=types.VoiceConfig(
+                            prebuilt_voice_config=types.PrebuiltVoiceConfig(
+                                voice_name="Kore"
+                            )
+                        )
+                    ),
+                ),
+            )
+            if response.candidates and response.candidates[0].content.parts:
+                part = response.candidates[0].content.parts[0]
+                if hasattr(part, "inline_data") and part.inline_data:
+                    return part.inline_data.data, part.inline_data.mime_type
+            return None, None
+
+        try:
+            raw_data, mime_type = await asyncio.to_thread(_generate)
+            if not raw_data or self.audio_in_queue is None:
+                return
+
+            # Strip WAV container header to get raw PCM bytes
+            if mime_type and "wav" in mime_type.lower():
+                with wave.open(io.BytesIO(raw_data)) as wf:
+                    pcm_data = wf.readframes(wf.getnframes())
+            else:
+                pcm_data = raw_data
+
+            await self.audio_in_queue.put(pcm_data)
+        except Exception as e:
+            logger.warning(f"TTS phrase generation failed: {e}")
+
     async def _execute_document_query(self, query: str) -> str:
         """Route query through the PDF smart indexer for focused retrieval.
 
@@ -781,6 +827,10 @@ class GeminiLiveHandler:
                     self.out_queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
+
+        # Announce the lookup while the mic stays muted; TTS is enqueued so it
+        # plays concurrently with the RAG retrieval below.
+        await self._speak_phrase("Let me check the manual for you, one moment.")
 
         try:
             # Try smart PDF indexer first (handles large PDFs efficiently)
