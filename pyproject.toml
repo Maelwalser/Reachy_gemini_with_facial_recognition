@@ -26,6 +26,8 @@ dependencies = [
     "opencv-python",
     "scipy",
     "python-dotenv",
+    "PyMuPDF",           
+    "face_recognition"   
 ]
 
 [project.optional-dependencies]

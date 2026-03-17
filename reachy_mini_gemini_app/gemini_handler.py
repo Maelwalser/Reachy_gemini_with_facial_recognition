@@ -169,6 +169,9 @@ class GeminiLiveHandler:
 
         self.is_imitating = False
         self.speak_until = 0.0
+        # Set to True while a RAG/PDF query is in flight so the mic loops
+        # do not forward any audio to Gemini and trigger a second lookup.
+        self._rag_in_progress = False
 
         # Log configuration
         logger.info(f"Audio config: mic_gain={mic_gain}, chunk_size={chunk_size}")
@@ -758,43 +761,64 @@ class GeminiLiveHandler:
             # Drop frame if we are inside the mathematical playback window + 0.4s room echo delay
             if time.time() < getattr(self, "speak_until", 0.0) + 0.4:
                 continue
+            # Mute while a PDF/RAG query is in flight to avoid triggering a second lookup
+            if self._rag_in_progress:
+                continue
             await out_q.put({"data": data, "mime_type": "audio/pcm"})
 
     async def _execute_document_query(self, query: str) -> str:
-        """Route query through the PDF smart indexer for focused retrieval."""
-        # Try smart PDF indexer first (handles large PDFs efficiently)
-        if self.pdf_indexer and self.pdf_indexer.indices:
-            logger.info(f"Routing query to PDF indexer: {query}")
-            return await self.pdf_indexer.query(query)
+        """Route query through the PDF smart indexer for focused retrieval.
 
-        # Fallback to legacy uploaded files (non-PDF knowledge files)
-        if not self.uploaded_knowledge_files:
-            return "Error: No reference documents are currently loaded into the system."
-
-        logger.info(f"Falling back to legacy file query for: {query}")
-
-        def _run_query():
-            extraction_prompt = (
-                f"Provide the exact, step-by-step technical instructions for the following query. "
-                f"You must include all measurements, torque values, and hardware specifications verbatim "
-                f"as they appear in the source text. Query: {query}"
-            )
-
-            response = self.client.models.generate_content(
-                model="gemini-2.5-flash",
-                contents=[
-                    self.uploaded_knowledge_files[0],
-                    extraction_prompt,
-                ],
-            )
-            return response.text
+        Mutes the microphone for the entire duration so that incidental speech
+        during the (multi-second) retrieval does not cause Gemini to issue a
+        second query_technical_manual call before the first one has resolved.
+        """
+        self._rag_in_progress = True
+        # Drain any audio already queued so it is not forwarded to Gemini
+        if self.out_queue is not None:
+            while not self.out_queue.empty():
+                try:
+                    self.out_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
 
         try:
+            # Try smart PDF indexer first (handles large PDFs efficiently)
+            if self.pdf_indexer and self.pdf_indexer.indices:
+                logger.info(f"Routing query to PDF indexer: {query}")
+                return await self.pdf_indexer.query(query)
+
+            # Fallback to legacy uploaded files (non-PDF knowledge files)
+            if not self.uploaded_knowledge_files:
+                return "Error: No reference documents are currently loaded into the system."
+
+            logger.info(f"Falling back to legacy file query for: {query}")
+
+            def _run_query():
+                extraction_prompt = (
+                    f"Provide the exact, step-by-step technical instructions for the following query. "
+                    f"You must include all measurements, torque values, and hardware specifications verbatim "
+                    f"as they appear in the source text. Query: {query}"
+                )
+
+                response = self.client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=[
+                        self.uploaded_knowledge_files[0],
+                        extraction_prompt,
+                    ],
+                )
+                return response.text
+
             result = await asyncio.to_thread(_run_query)
             return result if result else "No relevant information found in the manual."
+
         except Exception as e:
             logger.error(f"Document query failed: {e}")
             return f"System error during document retrieval: {e}"
+
+        finally:
+            self._rag_in_progress = False
 
     async def _fetch_weather_data(
         self, lat: float, lon: float, location_name: str
@@ -866,6 +890,9 @@ class GeminiLiveHandler:
                     continue
 
                 if time.time() < getattr(self, "speak_until", 0.0) + 0.4:
+                    continue
+                # Mute while a PDF/RAG query is in flight to avoid triggering a second lookup
+                if self._rag_in_progress:
                     continue
                 if isinstance(sample, np.ndarray):
                     if sample.dtype == np.float32:
