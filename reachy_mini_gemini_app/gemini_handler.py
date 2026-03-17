@@ -29,6 +29,7 @@ from reachy_mini import ReachyMini
 from scipy import signal
 
 from reachy_mini_gemini_app.movements import MovementController
+from reachy_mini_gemini_app.pdf_indexer import PDFIndexer
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,10 @@ class GeminiLiveHandler:
         self.knowledge_files = knowledge_files or []
         self.uploaded_files: list[Any] = []
         self.uploaded_knowledge_files: list[Any] = []
-        self.document_cache: Any = None  # Stores the pre-computed active memory cache
+        self.document_cache: Any = None
+
+        # PDF smart indexer (replaces brute-force Context Cache for large docs)
+        self.pdf_indexer: PDFIndexer | None = None
 
         # Configurable audio settings
         self.mic_gain = mic_gain
@@ -517,64 +521,90 @@ class GeminiLiveHandler:
                 logger.error(f"Failed to process reference image {image_path}: {e}")
 
     def _upload_knowledge_files(self) -> None:
-        """Upload documents and store references for asynchronous tool retrieval."""
+        """Index PDF documents for smart retrieval; upload non-PDFs to Gemini File API."""
         self.uploaded_knowledge_files = []
         if not self.knowledge_files:
             return
 
         logger.info(f"Processing {len(self.knowledge_files)} knowledge files...")
 
-        for file_path in self.knowledge_files:
+        pdf_files = [
+            f
+            for f in self.knowledge_files
+            if f.lower().endswith(".pdf") and os.path.exists(f)
+        ]
+        other_files = [
+            f
+            for f in self.knowledge_files
+            if not f.lower().endswith(".pdf") and os.path.exists(f)
+        ]
+
+        # --- Smart PDF indexing ---
+        if pdf_files:
+            self.pdf_indexer = PDFIndexer(self.client)
+
+            # _upload_knowledge_files is called from run() which is already inside
+            # an event loop. We need to run the async index_all from this sync context.
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+
+            if loop and loop.is_running():
+                # We're inside an active event loop — run indexing in a separate thread
+                import concurrent.futures
+
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = pool.submit(
+                        lambda: asyncio.run(self.pdf_indexer.index_all(pdf_files))  # type: ignore[union-attr]
+                    )
+                    results = future.result()
+            else:
+                # No running loop — safe to use run_until_complete
+                new_loop = asyncio.new_event_loop()
+                try:
+                    results = new_loop.run_until_complete(
+                        self.pdf_indexer.index_all(pdf_files)
+                    )
+                finally:
+                    new_loop.close()
+
+            for fp, count in results.items():
+                if count > 0:
+                    logger.info(f"Indexed {fp}: {count} pages")
+                else:
+                    logger.error(f"Failed to index {fp}")
+
+        # --- Legacy upload for non-PDF files (txt, etc.) ---
+        for file_path in other_files:
             if not os.path.exists(file_path):
                 logger.warning(f"Knowledge file not found: {file_path}")
                 continue
 
-            logger.info(f"Uploading {file_path} to Gemini File API...")
-            uploaded_file = self.client.files.upload(file=file_path)
+            logger.info(f"Uploading non-PDF file {file_path} to Gemini File API...")
+            try:
+                uploaded_file = self.client.files.upload(file=file_path)
 
-            # Assertions to satisfy Pyright's Optional type checking
-            assert uploaded_file is not None
-            assert uploaded_file.name is not None
-            assert uploaded_file.state is not None
-
-            while uploaded_file.state.name == "PROCESSING":
-                time.sleep(2)
-                uploaded_file = self.client.files.get(name=uploaded_file.name)
-                # Re-assert after fetching the updated state
+                # Assertions to satisfy Pyright's Optional type checking
                 assert uploaded_file is not None
                 assert uploaded_file.name is not None
                 assert uploaded_file.state is not None
 
-            if uploaded_file.state.name == "FAILED":
-                logger.error(f"File processing failed: {file_path}")
-                continue
+                while uploaded_file.state.name == "PROCESSING":
+                    time.sleep(2)
+                    uploaded_file = self.client.files.get(name=uploaded_file.name)
+                    assert uploaded_file is not None
+                    assert uploaded_file.name is not None
+                    assert uploaded_file.state is not None
 
-            # Store the File object. It resides on Google's servers, costing zero local memory.
-            self.uploaded_knowledge_files.append(uploaded_file)
-            logger.info(f"Successfully mapped {file_path} for retrieval.")
-        # NEW LOGIC: Pre-compute the cache for low-latency retrieval
-        if self.uploaded_knowledge_files:
-            logger.info("Constructing active Context Cache for the manuals...")
-            try:
-                self.document_cache = self.client.caches.create(
-                    model="gemini-2.5-flash",
-                    config=types.CreateCachedContentConfig(
-                        contents=self.uploaded_knowledge_files,
-                        system_instruction=(
-                            "You are a rigorous technical data extractor. You must extract highly detailed, "
-                            "step-by-step instructions directly from the provided manual. You must include all "
-                            "specific technical metrics, part numbers, screw types (e.g., 'M3x16 8.8'), and "
-                            "torque specifications (e.g., 'Anzugsdrehmoment: 0,9 Nm') verbatim. Never summarize "
-                            "a procedure by merely stating it can be found in the text."
-                        ),
-                        ttl="3600s",
-                    ),
-                )
-                logger.info(
-                    f"Context Cache created successfully: {self.document_cache.name}"
-                )
+                if uploaded_file.state.name == "FAILED":
+                    logger.error(f"File processing failed: {file_path}")
+                    continue
+
+                self.uploaded_knowledge_files.append(uploaded_file)
+                logger.info(f"Successfully uploaded {file_path} for retrieval.")
             except Exception as e:
-                logger.error(f"Failed to create Context Cache: {e}")
+                logger.error(f"Failed to upload {file_path}: {e}")
 
     async def _handle_tool_call(self, tool_call: Any) -> str:
         """Handle a function call from the model."""
@@ -661,7 +691,7 @@ class GeminiLiveHandler:
                 if not query:
                     return "Error: No search query provided."
                 return await self._execute_document_query(query)
-            
+
             elif name == "start_imitation":
                 self.is_imitating = True
                 self._saved_camera_fps = self.camera_fps
@@ -731,36 +761,32 @@ class GeminiLiveHandler:
             await out_q.put({"data": data, "mime_type": "audio/pcm"})
 
     async def _execute_document_query(self, query: str) -> str:
-        """Executes a low-latency generation call against the pre-computed Cache."""
-        if not self.uploaded_knowledge_files:
-            return "Error: No reference manuals are currently loaded into the system."
+        """Route query through the PDF smart indexer for focused retrieval."""
+        # Try smart PDF indexer first (handles large PDFs efficiently)
+        if self.pdf_indexer and self.pdf_indexer.indices:
+            logger.info(f"Routing query to PDF indexer: {query}")
+            return await self.pdf_indexer.query(query)
 
-        logger.info(f"Executing deep cache-accelerated search for: {query}")
+        # Fallback to legacy uploaded files (non-PDF knowledge files)
+        if not self.uploaded_knowledge_files:
+            return "Error: No reference documents are currently loaded into the system."
+
+        logger.info(f"Falling back to legacy file query for: {query}")
 
         def _run_query():
-            # Der erzwingende Prompt für die Datenextraktion
             extraction_prompt = (
                 f"Provide the exact, step-by-step technical instructions for the following query. "
                 f"You must include all measurements, torque values, and hardware specifications verbatim "
-                f"as they appear in the German source text. Query: {query}"
+                f"as they appear in the source text. Query: {query}"
             )
 
-            if getattr(self, "document_cache", None):
-                response = self.client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=extraction_prompt,
-                    config=types.GenerateContentConfig(
-                        cached_content=self.document_cache.name
-                    ),
-                )
-            else:
-                response = self.client.models.generate_content(
-                    model="gemini-2.5-flash",
-                    contents=[
-                        self.uploaded_knowledge_files[0],
-                        extraction_prompt,
-                    ],
-                )
+            response = self.client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=[
+                    self.uploaded_knowledge_files[0],
+                    extraction_prompt,
+                ],
+            )
             return response.text
 
         try:
@@ -1023,6 +1049,7 @@ class GeminiLiveHandler:
             except Exception as e:
                 logger.warning(f"Receive audio error: {e}")
                 await asyncio.sleep(0.1)
+
     async def play_audio(self) -> None:
         """Play received audio from queue."""
         if self.use_robot_audio:
@@ -1085,14 +1112,15 @@ class GeminiLiveHandler:
         while True:
             try:
                 bytestream = await in_q.get()
-                
+
                 # 16-bit audio = 2 bytes per sample. Calculate exact duration in seconds.
                 chunk_duration = (len(bytestream) / 2) / RECEIVE_SAMPLE_RATE
-                
+
                 # Push the mute window into the future
                 current_time = time.time()
                 self.speak_until = (
-                    max(current_time, getattr(self, "speak_until", 0.0)) + chunk_duration
+                    max(current_time, getattr(self, "speak_until", 0.0))
+                    + chunk_duration
                 )
 
                 audio_int16 = np.frombuffer(bytestream, dtype=np.int16)
@@ -1286,11 +1314,15 @@ class GeminiLiveHandler:
             logger.info("Holiday cheer mode enabled!")
 
         sys_parts = [types.Part.from_text(text=system_instruction)]
-        if hasattr(self, "uploaded_knowledge_files") and self.uploaded_knowledge_files:
+
+        has_knowledge = (
+            self.pdf_indexer and self.pdf_indexer.indices
+        ) or self.uploaded_knowledge_files
+        if has_knowledge:
             sys_parts.append(
                 types.Part.from_text(
-                    text="\n\n[SYSTEM NOTICE: A technical reference manual has been loaded into your memory bank. "
-                    "You MUST use the `query_technical_manual` tool to search it whenever the user asks for "
+                    text="\n\n[SYSTEM NOTICE: Technical reference documents have been indexed and are available for retrieval. "
+                    "You MUST use the `query_technical_manual` tool to search them whenever the user asks for "
                     "specific technical details, instructions, or documentation.]"
                 )
             )
@@ -1385,19 +1417,11 @@ class GeminiLiveHandler:
                 pass
 
     async def close(self) -> None:
-        """Clean up resources and active caches."""
+        """Clean up resources."""
         await self._cleanup_streams()
 
         if self.pya:
             self.pya.terminate()
             self.pya = None
-
-        # Destroy the active memory cache to halt billing
-        if getattr(self, "document_cache", None):
-            try:
-                self.client.caches.delete(name=self.document_cache.name)
-                logger.info("Context Cache successfully purged from active memory.")
-            except Exception as e:
-                logger.warning(f"Failed to delete Context Cache: {e}")
 
         logger.info("Gemini handler closed")
